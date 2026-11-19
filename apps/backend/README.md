@@ -50,6 +50,11 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `RELAYER_MAX_ATTEMPTS` | Submission attempts on `txBadSeq` / `TRY_AGAIN_LATER` (defaults to 3) | `3` |
 | `RELAYER_QUEUE_TIMEOUT_MS` | Longest a relay waits for a free channel before `503` (defaults to 30000) | `30000` |
 | `RELAYER_AUTH_VALIDITY_LEDGERS` | Ledgers a prepared merchant authorization remains signable (defaults to 100, ~8 minutes) | `100` |
+| `RECURRING_PULLS_ENABLED` | Starts the recurring pull daemon only when explicitly set to `true`; requires the relayer and the recurring-pull migration | `false` |
+| `RECURRING_PULL_SIGNER_URL` | HTTPS endpoint for the merchant-controlled signer/HSM gateway; receives a scoped pull authorization, never a private key | `https://signer.example/sign` |
+| `RECURRING_PULL_SIGNER_TOKEN` | Bearer token used to authenticate requests to the configured signer | `******` |
+| `RECURRING_PULL_INTERVAL_MS` | Delay between daemon scans (defaults to 30000 ms) | `30000` |
+| `RECURRING_PULL_MAX_ATTEMPTS` | Maximum submission attempts per cycle, including the first attempt (defaults to 4) | `4` |
 | `RELAYER_RATE_LIMIT_MAX` / `RELAYER_RATE_LIMIT_WINDOW_MS` | Relay requests allowed per merchant per window (defaults to 10 per 60000 ms) | `10` |
 | `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
 | `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
@@ -73,6 +78,15 @@ node index.js
 ```
 
 The service runs at `http://localhost:3001`.
+
+The automated pull daemon is opt-in. Before enabling it, apply the backend
+migrations and configure the relayer plus an authenticated merchant-controlled
+signer/HSM endpoint. The signer receives the exact Soroban authorization entry,
+subscriber and merchant addresses, contract, network, and ledger expiry; it
+must enforce its own merchant authorization policy and return
+`signed_auth_entry_xdr`. Pull claims are unique per vault and scheduled billing
+cycle, and an unconfirmed transaction hash is retained for polling rather than
+submitting a replacement. Transient failures retry after 1, 5, and 15 minutes.
 
 ---
 
