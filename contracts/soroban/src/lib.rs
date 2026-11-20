@@ -3,8 +3,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 // ----------------------------------------------------------------------------
@@ -74,6 +74,46 @@ pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
 // ----------------------------------------------------------------------------
 // DATA STRUCTURES
 // ----------------------------------------------------------------------------
+
+/// Typed authorization a subscriber signs so a relayer can create their vault
+/// without the subscriber paying network fees (#296). The subscriber signs
+/// [`delegated_vault_digest`] of this payload; any account may then submit it
+/// through `create_vault_delegated`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedVaultAuthorization {
+    /// Subscriber; must be an Ed25519 account (`G...`) so their key can sign.
+    pub user: Address,
+    pub merchant: Address,
+    /// Token the allowance is for. Signed so a relayer cannot swap it.
+    pub token: Address,
+    /// Amount per billing interval, in the token's base units.
+    pub amount: i128,
+    /// Billing interval in ledgers (~5s each).
+    pub interval_ledgers: u32,
+    /// Must equal `get_user_nonce(user)`; consumed on success.
+    pub nonce: u64,
+    /// Last ledger sequence at which the signature is valid.
+    pub expiry_ledger: u32,
+}
+
+/// Errors returned by `create_vault_delegated` (#296).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum DelegatedAuthError {
+    /// The subscriber cannot have produced an Ed25519 signature (not an
+    /// Ed25519 account address). A signature that fails verification against
+    /// the subscriber's key is rejected by the host's Ed25519 check, which
+    /// aborts the invocation before this error could be returned.
+    InvalidSignature = 1,
+    /// `nonce` is not the subscriber's current nonce: replayed or stale.
+    InvalidNonce = 2,
+    /// The current ledger is past `expiry_ledger`.
+    SignatureExpired = 3,
+    /// `amount` or `interval_ledgers` is not positive, or the interval overflows.
+    InvalidAuthorization = 4,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1921,7 +1961,10 @@ impl OrbitContract {
         user.require_auth();
         merchant.require_auth();
         assert!(escrow_window_seconds > 0, "Escrow window must be positive");
-        assert!(dispute_timeout_ledgers > 0, "Dispute timeout must be positive");
+        assert!(
+            dispute_timeout_ledgers > 0,
+            "Dispute timeout must be positive"
+        );
         let vault: VaultData = env
             .storage()
             .persistent()
@@ -1984,7 +2027,9 @@ impl OrbitContract {
         assert!(hold.disputed, "Escrow is not disputed");
         assert!(hold.arbitrator == arbitrator, "Unauthorized arbitrator");
         assert!(
-            env.ledger().sequence().saturating_sub(hold.dispute_started_ledger)
+            env.ledger()
+                .sequence()
+                .saturating_sub(hold.dispute_started_ledger)
                 < hold.dispute_timeout_ledgers,
             "Dispute timeout elapsed"
         );
@@ -2244,8 +2289,7 @@ impl OrbitContract {
         );
 
         // Extend storage TTL for the new interval
-        let (threshold, extend_to) =
-            calculate_ttl_params(vault.interval_seconds);
+        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
@@ -4331,6 +4375,71 @@ impl OrbitContract {
         remove_vault(&env, &user, &merchant);
     }
 
+    /// Create a vault from a subscriber-signed [`DelegatedVaultAuthorization`]
+    /// (#296). Anyone, typically a relayer or fee-bump submitter, may call it,
+    /// so a subscriber holding only USDC can onboard without XLM for fees.
+    ///
+    /// Checks, cheapest first: expiry, nonce, payload sanity, then a single
+    /// Ed25519 verification over [`delegated_vault_digest`]. On success the
+    /// subscriber's nonce is consumed, so the same signature can never be
+    /// replayed. The nonce is shared with `create_vault_with_signature`, so
+    /// the two signature schemes cannot be replayed into each other either.
+    pub fn create_vault_delegated(
+        env: Env,
+        authorization: DelegatedVaultAuthorization,
+        signature: BytesN<64>,
+    ) -> Result<(), DelegatedAuthError> {
+        if env.ledger().sequence() > authorization.expiry_ledger {
+            return Err(DelegatedAuthError::SignatureExpired);
+        }
+        let current_nonce = load_user_nonce(&env, &authorization.user);
+        if authorization.nonce != current_nonce {
+            return Err(DelegatedAuthError::InvalidNonce);
+        }
+        if authorization.amount <= 0 || authorization.interval_ledgers == 0 {
+            return Err(DelegatedAuthError::InvalidAuthorization);
+        }
+        let interval_seconds = u64::from(authorization.interval_ledgers)
+            .checked_mul(SECONDS_PER_LEDGER)
+            .ok_or(DelegatedAuthError::InvalidAuthorization)?;
+        let pubkey = ed25519_account_key(&env, &authorization.user)
+            .ok_or(DelegatedAuthError::InvalidSignature)?;
+
+        let digest = delegated_vault_digest(&env, &authorization);
+        env.crypto().ed25519_verify(
+            &pubkey,
+            &Bytes::from_array(&env, &digest.to_array()),
+            &signature,
+        );
+
+        bump_user_nonce(&env, &authorization.user, current_nonce);
+        write_vault(
+            &env,
+            &authorization.user,
+            &authorization.merchant,
+            &authorization.token,
+            authorization.amount,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+            0,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_delegated"),
+                authorization.user,
+                authorization.merchant,
+            ),
+            (
+                authorization.token,
+                authorization.amount,
+                authorization.interval_ledgers,
+                authorization.nonce,
+            ),
+        );
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // MULTI-SIG GOVERNANCE & TIMELOCK (#255)
     // -----------------------------------------------------------------------
@@ -4352,7 +4461,11 @@ impl OrbitContract {
 
         let proposed_key = DataKey::ProposedAdmin;
         env.storage().persistent().set(&proposed_key, &new_admin);
-        extend_feature_key(&env, &admin_key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        extend_feature_key(
+            &env,
+            &admin_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "admin_proposed"), current_admin),
@@ -4370,10 +4483,7 @@ impl OrbitContract {
             .persistent()
             .get(&proposed_key)
             .expect("No admin proposal pending");
-        assert!(
-            proposed == new_admin,
-            "You are not the proposed admin"
-        );
+        assert!(proposed == new_admin, "You are not the proposed admin");
 
         let admin_key = FeatureKey::Admin;
         let old_admin: Address = env
@@ -4384,7 +4494,11 @@ impl OrbitContract {
 
         env.storage().persistent().set(&admin_key, &new_admin);
         env.storage().persistent().remove(&proposed_key);
-        extend_feature_key(&env, &admin_key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        extend_feature_key(
+            &env,
+            &admin_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"), old_admin),
@@ -4399,12 +4513,7 @@ impl OrbitContract {
 
     /// Queue a protocol parameter update with a minimum timelock delay (~24 hours).
     /// The parameter must be queued before execution.
-    pub fn queue_param_update(
-        env: Env,
-        admin: Address,
-        param_name: Symbol,
-        new_value: Bytes,
-    ) {
+    pub fn queue_param_update(env: Env, admin: Address, param_name: Symbol, new_value: Bytes) {
         admin.require_auth();
 
         let admin_key = FeatureKey::Admin;
@@ -4413,7 +4522,10 @@ impl OrbitContract {
             .persistent()
             .get(&admin_key)
             .expect("No admin configured");
-        assert!(stored_admin == admin, "Only the admin can queue parameter updates");
+        assert!(
+            stored_admin == admin,
+            "Only the admin can queue parameter updates"
+        );
 
         let now = env.ledger().timestamp();
         let timelock_duration: u64 = 17280 * 5; // ~24 hours in seconds (17,280 ledgers)
@@ -4446,7 +4558,10 @@ impl OrbitContract {
             .persistent()
             .get(&admin_key)
             .expect("No admin configured");
-        assert!(stored_admin == admin, "Only the admin can execute parameter updates");
+        assert!(
+            stored_admin == admin,
+            "Only the admin can execute parameter updates"
+        );
 
         let queue_key = DataKey::TimelockQueue(param_name.clone());
         let entry: TimelockEntry = env
@@ -4456,10 +4571,7 @@ impl OrbitContract {
             .expect("No queued update for this parameter");
 
         let now = env.ledger().timestamp();
-        assert!(
-            now >= entry.execute_after,
-            "Timelock has not elapsed yet"
-        );
+        assert!(now >= entry.execute_after, "Timelock has not elapsed yet");
 
         env.storage().persistent().remove(&queue_key);
 
@@ -4601,19 +4713,47 @@ pub fn cancel_vault_meta_digest(
     meta_digest(env, "cancel_vault", &params, nonce, deadline)
 }
 
-/// Extracts the Ed25519 master key from an account (`G...`) user address.
-fn account_ed25519_key(env: &Env, user: &Address) -> BytesN<32> {
+/// Message a subscriber signs for `create_vault_delegated` (#296):
+/// `SHA256(contract_address || network_id || "create_vault_delegated" || XDR(authorization))`.
+///
+/// The contract address and network id bind the signature to this deployment
+/// and network; the function symbol keeps it from verifying as any other
+/// signed message. Public so relayers and tests build the exact same bytes.
+pub fn delegated_vault_digest(
+    env: &Env,
+    authorization: &DelegatedVaultAuthorization,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = env.current_contract_address().to_xdr(env);
+    data.append(&Bytes::from_array(
+        env,
+        &env.ledger().network_id().to_array(),
+    ));
+    data.append(&Symbol::new(env, "create_vault_delegated").to_xdr(env));
+    data.append(&authorization.clone().to_xdr(env));
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// The Ed25519 key behind an account (`G...`) address, or `None` for any
+/// other address kind (e.g. a contract), which cannot sign with Ed25519.
+fn ed25519_account_key(env: &Env, user: &Address) -> Option<BytesN<32>> {
     use soroban_sdk::xdr::ToXdr;
     // ScVal::Address XDR: 4-byte discriminant, 4-byte address type, 4-byte
     // key type, then the 32-byte Ed25519 public key for account addresses.
     let xdr = user.clone().to_xdr(env);
-    let addr_type: BytesN<4> = xdr.slice(4..8).try_into().expect("Address payload");
-    assert_eq!(
-        addr_type.to_array(),
-        [0, 0, 0, 0],
-        "User must be an account address"
-    );
-    xdr.slice(12..44).try_into().expect("account ed25519 key")
+    if xdr.len() < 44 {
+        return None;
+    }
+    let addr_type: BytesN<4> = xdr.slice(4..8).try_into().ok()?;
+    if addr_type.to_array() != [0, 0, 0, 0] {
+        return None;
+    }
+    xdr.slice(12..44).try_into().ok()
+}
+
+/// Extracts the Ed25519 master key from an account (`G...`) user address.
+fn account_ed25519_key(env: &Env, user: &Address) -> BytesN<32> {
+    ed25519_account_key(env, user).expect("User must be an account address")
 }
 
 fn verify_meta_signature(env: &Env, user: &Address, digest: &BytesN<32>, signature: &BytesN<64>) {
