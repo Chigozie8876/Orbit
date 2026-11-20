@@ -88,7 +88,7 @@ function createInvoiceService({ supabase, bucket = process.env.INVOICE_STORAGE_B
                 .update({ status: 'ready', storage_bucket: bucket, storage_path: storagePath, generated_at: new Date().toISOString() })
                 .eq('id', invoice.id).select().single();
             if (finalizeError) throw finalizeError;
-            return { invoice: finalized };
+            return { invoice: finalized, pdf };
         } catch (generationError) {
             logger.error('Invoice generation failed:', generationError);
             await supabase.from('invoices').update({ status: 'failed', failure_reason: generationError.message }).eq('id', invoice.id);

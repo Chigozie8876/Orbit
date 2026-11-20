@@ -6,3 +6,4 @@
 // contract change with `npm run generate:contract-sdk` from apps/backend.
 export * from './scval';
 export * from './generated/orbit-contract';
+export * from './webhooks';
