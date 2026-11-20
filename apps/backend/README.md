@@ -51,6 +51,10 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `RELAYER_QUEUE_TIMEOUT_MS` | Longest a relay waits for a free channel before `503` (defaults to 30000) | `30000` |
 | `RELAYER_AUTH_VALIDITY_LEDGERS` | Ledgers a prepared merchant authorization remains signable (defaults to 100, ~8 minutes) | `100` |
 | `RELAYER_RATE_LIMIT_MAX` / `RELAYER_RATE_LIMIT_WINDOW_MS` | Relay requests allowed per merchant per window (defaults to 10 per 60000 ms) | `10` |
+| `RELAYER_MAX_BASE_FEE_STROOPS` | Highest inclusion fee per operation the relayer offers when sponsoring a subscriber transaction, however congested the network (defaults to 10000) | `10000` |
+| `RELAYER_ALLOWED_TOKEN_CONTRACTS` | Comma-separated token contracts a sponsored vault may use and `approve` may be called on (defaults to `USDC_CONTRACT_ID`). With neither set, nothing is sponsored | `C...,C...` |
+| `RELAYER_ALLOWED_TRUSTLINE_ASSETS` | Comma-separated `CODE:ISSUER` assets a sponsored transaction may add a trustline for (defaults to none) | `USDC:GA5Z...` |
+| `RELAYER_SPONSOR_RATE_LIMIT_MAX` / `RELAYER_SPONSOR_RATE_LIMIT_WINDOW_MS` | `POST /api/relayer/sponsor` requests allowed per client IP per window (defaults to 5 per 60000 ms) | `5` |
 | `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
 | `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
 | `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
@@ -94,6 +98,7 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/relay/prepare-pull` | API key | Get the authorization entry for a gas-sponsored pull |
 | `POST` | `/relay/submit-pull` | API key | Submit a merchant-authorized pull through the fee-bump relayer |
 | `GET` | `/relay/budget` | API key | Today's sponsored fee usage and remaining budget |
+| `POST` | `/api/relayer/sponsor` | Public (policy-checked) | Fee-bump a subscriber-signed vault-creation transaction for gasless onboarding. `/relay/sponsor-transaction` is an alias |
 | `POST` | `/subscriptions` | Public | Record a customer subscription after handshake |
 | `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
 | `GET` | `/api-keys` | API key | List the merchant's API keys |
@@ -629,6 +634,52 @@ Status: `200 OK`
     "error": "permission denied for table exchange_rates"
   }
   ```
+
+### 7. POST /api/relayer/sponsor (gasless onboarding)
+
+Wraps a subscriber-signed transaction in a `FeeBumpTransaction` paid by the Orbit relayer
+(`RELAYER_SECRET_KEY`), so a subscriber holding USDC but no XLM can create their vault.
+The route is public because checkout has no merchant API key. Every request must pass
+`sponsorship.js` before the relayer signs or spends anything.
+
+Request body: `{ "signed_tx_xdr": "<base64 envelope>" }`. `tx_xdr` is also accepted.
+
+**Policy (403 when it fails):**
+
+- The transaction is a plain, signed transaction on the relayer's network. Fee bumps,
+  unsigned transactions and transactions signed for another network are refused (400/401).
+- Its source is not a relayer account, and no operation overrides the source.
+- Every operation is one of:
+  - a vault-creation call on `ORBIT_CONTRACT_ID`: `create_vault*`,
+    `create_vault_with_signature` or `create_vault_delegated`;
+  - `approve(from = source, spender = Orbit)` on an allowed token contract;
+  - a trustline for an allowed asset.
+
+  Payments, other contracts, deploys and other functions are refused.
+- The vault's token is an allowed token contract.
+- The vault's merchant, the recipient of every future pull, is a registered Orbit
+  merchant (`merchants.wallet_address`). All vaults in one transaction share it.
+- No Soroban authorization entry claims a relayer account.
+
+**Fee limits:**
+
+- The caller never sets the fee. The relayer offers its fee estimate, clamped to
+  `RELAYER_MAX_BASE_FEE_STROOPS` per operation.
+- It refuses (422 `fee_cap_exceeded`) any fee bump over `RELAYER_MAX_FEE_STROOPS`.
+- The fee is booked against the merchant's daily budget (`RELAYER_DAILY_FEE_LIMIT_STROOPS`,
+  429 when exhausted) and settled to the fee actually charged.
+- A transaction that fails simulation is never submitted (422 `simulation_failed`).
+- Requests are rate-limited per client IP.
+
+**Responses:**
+
+- `200 { status: "SUCCESS", tx_hash, sponsor_address, fee_charged_stroops, max_fee_stroops }`
+- `202 { status: "PENDING", tx_hash }` if confirmation does not arrive within the poll timeout
+- `422 { status: "FAILED", code: "transaction_failed", tx_hash }` if it fails on-chain
+- `503` when no relayer is configured
+
+> **Behaviour change:** `/relay/sponsor-transaction` (#169) used to fee-bump any
+> transaction it was given, unauthenticated and unthrottled. It now enforces this policy.
 
 ---
 
