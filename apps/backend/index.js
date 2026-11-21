@@ -27,6 +27,7 @@ const {
     replayWebhookEvents,
     replayDeadLetter,
     setDeliveryObserver,
+    verifyWebhookEndpoint,
 } = require('./webhooks');
 const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
@@ -2041,6 +2042,21 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     const { data, error } = await supabase.from('webhooks').update({ previous_signing_secret: req.body?.signing_secret || null, signing_secret: secret, secret_rotated_at: new Date().toISOString() }).eq('id', req.params.id).select('id,secret_rotated_at').single();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ webhook: data, signing_secret: secret });
+});
+
+app.post('/webhooks/:id/verify', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+        const result = await verifyWebhookEndpoint(supabase, {
+            webhookId: req.params.id,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (result.statusCode) return res.status(result.statusCode).json({ error: result.error });
+        res.status(result.ok ? 200 : 502).json(result);
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
 });
 
 app.post('/webhooks/:id/backfill', async (req, res) => {

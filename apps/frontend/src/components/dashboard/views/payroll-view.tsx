@@ -38,6 +38,7 @@ import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRe
 import { simulatePayrollRun } from "@/lib/payroll-simulation";
 import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
 import { MilestonePayrollPanel } from "./milestone-payroll-panel";
+import { StreamingPayrollPanel } from "./streaming-payroll-panel";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -558,6 +559,9 @@ export function PayrollView() {
   return (
     <div className="space-y-6">
       <MilestonePayrollPanel canRunPayroll={canRunPayroll} />
+
+      {/* Live streaming payroll balances (#291) */}
+      <StreamingPayrollPanel />
 
       {/* Sub-tab Switcher: Direct Batch vs Pending Approvals (Multi-Sig Queue) (#250) */}
       <div className="flex items-center gap-2 border-b border-black/10 pb-2">
