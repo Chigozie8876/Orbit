@@ -27,6 +27,7 @@ import {
   Calendar,
   PauseCircle,
   UserX,
+  Mail,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
 import { SubscriberRecord } from "../dashboard-types";
@@ -34,11 +35,25 @@ import {
   fetchSubscribers,
   mapApiSubscriberToRecord,
   ORBIT_API_URL,
+  sendBalanceReminder,
   setMerchantApiKey,
 } from "@/lib/api";
+import {
+  assessSubscriberHealth,
+  canSendBalanceReminder,
+  summarizeChurnRisk,
+  type SubscriberHealth,
+} from "@/lib/subscriber-health";
+import { ChurnRiskCard, HealthBadge } from "../subscriber-health-ui";
 import { CustomerDetailDrawer } from "../drawers/customer-detail-drawer";
 import { PastDueResolutionModal } from "../modals/past-due-resolution-modal";
 import { retrySignedPull } from "@/lib/billing-resolution";
+
+// Demo dates are relative to page load so health scoring stays meaningful.
+const demoInDays = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
+
+/** A balance reminder is allowed once per subscription per day (API cooldown). */
+const REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
   {
@@ -52,6 +67,9 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
     nextPullDate: "Due Now",
     totalSettled: 116.0,
     joinedDate: "May 18, 2026",
+    nextBillingAt: demoInDays(0),
+    liquidity: { balance: 12.4, allowance: 290 },
+    hasContactEmail: true,
   },
   {
     id: "sub_alice_4812",
@@ -64,6 +82,9 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
     nextPullDate: "In 12 days",
     totalSettled: 45.0,
     joinedDate: "Jul 02, 2026",
+    nextBillingAt: demoInDays(12),
+    liquidity: { balance: 210, allowance: 180 },
+    hasContactEmail: true,
   },
   {
     id: "sub_david_8932",
@@ -88,6 +109,9 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
     nextPullDate: "In 18 days",
     totalSettled: 87.0,
     joinedDate: "Jun 14, 2026",
+    nextBillingAt: demoInDays(18),
+    liquidity: { balance: 450, allowance: 40 },
+    hasContactEmail: true,
   },
   {
     id: "sub_marcus_7721",
@@ -102,6 +126,8 @@ export const INITIAL_SUBSCRIBERS: SubscriberRecord[] = [
     joinedDate: "Aug 01, 2026",
     dunningStatus: "pending",
     retryCount: 1,
+    lastFailure: { code: "insufficient_balance", message: "Insufficient USDC balance" },
+    hasContactEmail: false,
   },
   {
     id: "sub_kenji_6120",
@@ -172,6 +198,10 @@ export function SubscribersView() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [resolutionSubscriber, setResolutionSubscriber] = useState<SubscriberRecord | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
+  const [showAtRiskOnly, setShowAtRiskOnly] = useState(false);
+  const [remindingId, setRemindingId] = useState<string | null>(null);
+  const [reminderNotice, setReminderNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const tHealth = useTranslations("SubscriberHealth");
 
   // Load subscribers from Merchant API or fallback to Demo Data
   const loadSubscribers = useCallback(async () => {
@@ -384,6 +414,42 @@ export function SubscribersView() {
     return Array.from(plansMap.entries()).map(([id, name]) => ({ id, name }));
   }, [subscribers]);
 
+  // Health is re-scored whenever subscriber data changes (#298)
+  const healthById = useMemo(
+    () => new Map<string, SubscriberHealth>(subscribers.map((s) => [s.id, assessSubscriberHealth(s)])),
+    [subscribers],
+  );
+  const churnSummary = useMemo(() => summarizeChurnRisk(subscribers), [subscribers]);
+
+  /** Why the reminder button is disabled for this subscriber, or null when it can be sent. */
+  const reminderBlockedReason = (sub: SubscriberRecord): string | null => {
+    if (!isDemoMode && !sub.hasContactEmail) return tHealth("reminder.noEmail");
+    const last = sub.lastBalanceReminderAt ? Date.parse(sub.lastBalanceReminderAt) : NaN;
+    if (!Number.isNaN(last) && Date.now() - last < REMINDER_COOLDOWN_MS) return tHealth("reminder.cooldown");
+    return null;
+  };
+
+  const handleSendReminder = async (sub: SubscriberRecord) => {
+    setRemindingId(sub.id);
+    setReminderNotice(null);
+    try {
+      let sentAt = new Date().toISOString();
+      let recipient = tHealth("reminder.demoRecipient");
+      if (!isDemoMode) {
+        const result = await sendBalanceReminder(sub.id);
+        sentAt = result.sent_at;
+        recipient = result.recipient;
+      }
+      setSubscribers((prev) => prev.map((s) => (s.id === sub.id ? { ...s, lastBalanceReminderAt: sentAt } : s)));
+      setReminderNotice({ tone: "success", text: tHealth("reminder.sent", { recipient }) });
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setReminderNotice({ tone: "error", text: tHealth("reminder.failed", { error: message }) });
+    } finally {
+      setRemindingId(null);
+    }
+  };
+
   const filteredSubscribers = useMemo(() => {
     const q = debouncedSearch.toLowerCase().trim();
     const result = subscribers.filter((s) => {
@@ -399,6 +465,12 @@ export function SubscribersView() {
       // 2. Status Filter
       if (statusFilter !== "all" && s.status !== statusFilter) {
         return false;
+      }
+
+      // 2b. At-risk filter from the churn card (#298)
+      if (showAtRiskOnly) {
+        const level = healthById.get(s.id)?.level;
+        if (level !== "warning" && level !== "critical") return false;
       }
 
       // 3. Plan ID Filter
@@ -448,7 +520,7 @@ export function SubscribersView() {
     });
 
     return result;
-  }, [subscribers, debouncedSearch, statusFilter, planFilter, dateRangeFilter, sortField, sortDirection]);
+  }, [subscribers, debouncedSearch, statusFilter, planFilter, dateRangeFilter, sortField, sortDirection, showAtRiskOnly, healthById]);
 
   const selectedPendingVaults = subscribers.filter(
     (s) => selectedIds.has(s.id) && s.status === "pending_pull"
@@ -588,6 +660,26 @@ export function SubscribersView() {
               Use Demo Data
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Churn risk summary (#298) */}
+      <ChurnRiskCard
+        summary={churnSummary}
+        isLoading={isLoading}
+        showingAtRisk={showAtRiskOnly}
+        onToggleAtRisk={() => setShowAtRiskOnly((prev) => !prev)}
+      />
+      {reminderNotice && (
+        <div
+          role="status"
+          className={`p-3 rounded-xl border text-xs flex items-center gap-2 ${reminderNotice.tone === "success" ? "bg-emerald-50 border-emerald-200 text-emerald-900" : "bg-red-50 border-red-200 text-red-900"}`}
+        >
+          {reminderNotice.tone === "success" ? <Mail size={14} className="shrink-0" /> : <AlertCircle size={14} className="shrink-0" />}
+          <span className="flex-1">{reminderNotice.text}</span>
+          <button type="button" onClick={() => setReminderNotice(null)} className="text-[11px] underline">
+            {tHealth("reminder.dismiss")}
+          </button>
         </div>
       )}
 
@@ -908,6 +1000,9 @@ export function SubscribersView() {
                   {/* Status Column Header */}
                   <th className="py-3.5 px-4">{t("subscribers.status")}</th>
 
+                  {/* Health Column Header (#298) */}
+                  <th className="py-3.5 px-4">{t("subscribers.health")}</th>
+
                   {/* Actions Column Header */}
                   <th className="py-3.5 px-5 text-right">{t("subscribers.actions")}</th>
                 </tr>
@@ -920,6 +1015,10 @@ export function SubscribersView() {
                   const isCancelled = sub.status === "cancelled" || sub.status === "churned";
                   const isPaused = sub.status === "paused";
                   const isSelected = selectedIds.has(sub.id);
+                  const health = healthById.get(sub.id) ?? { level: null, factors: [] };
+                  const showReminder = canSendBalanceReminder(health);
+                  const reminderBlocked = showReminder ? reminderBlockedReason(sub) : null;
+                  const isReminding = remindingId === sub.id;
 
                   return (
                     <tr
@@ -1063,9 +1162,27 @@ export function SubscribersView() {
                         )}
                       </td>
 
+                      {/* Health (#298) */}
+                      <td className="py-4 px-4" onClick={(e) => e.stopPropagation()}>
+                        <HealthBadge health={health} />
+                      </td>
+
                       {/* Action Buttons */}
                       <td className="py-4 px-5 text-right" onClick={(e) => e.stopPropagation()}>
                         <div className="flex items-center justify-end gap-1.5">
+                          {showReminder && (
+                            <button
+                              type="button"
+                              onClick={() => handleSendReminder(sub)}
+                              disabled={isReminding || reminderBlocked !== null}
+                              className="button button-secondary h-7 px-2 text-xs inline-flex items-center gap-1 text-amber-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                              title={reminderBlocked ?? tHealth("reminder.title")}
+                              aria-label={`${tHealth("reminder.send")}: ${sub.walletAddress}`}
+                            >
+                              {isReminding ? <RotateCw size={11} className="animate-spin" /> : <Mail size={11} />}
+                              <span>{isReminding ? tHealth("reminder.sending") : tHealth("reminder.send")}</span>
+                            </button>
+                          )}
                           {isPastDue && <button className="button button-secondary h-7 px-2 text-xs text-red-700"
                             onClick={() => setResolutionSubscriber(sub)}>Resolve payment</button>}
                           {isDue && (

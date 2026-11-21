@@ -4654,3 +4654,315 @@ fn test_cancel_vault_with_signature() {
     assert!(orbit.get_vault(&user, &merchant).is_none());
     assert_eq!(orbit.get_user_nonce(&user), 2);
 }
+
+// ---------------------------------------------------------------------------
+// #296: delegated vault authorization via typed signatures
+// ---------------------------------------------------------------------------
+
+struct DelegatedFixture {
+    env: Env,
+    orbit: OrbitContractClient<'static>,
+    contract_id: Address,
+    signing_key: ed25519_dalek::SigningKey,
+    user: Address,
+    merchant: Address,
+    token: Address,
+}
+
+fn delegated_fixture() -> DelegatedFixture {
+    // No mock_all_auths(): delegated creation must not need the subscriber's
+    // (or anyone's) Soroban authorization, only the typed signature.
+    let env = Env::default();
+    let (signing_key, user) = meta_signer(&env, 42);
+    let merchant = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    env.ledger().set_sequence_number(100);
+    DelegatedFixture {
+        env,
+        orbit,
+        contract_id,
+        signing_key,
+        user,
+        merchant,
+        token,
+    }
+}
+
+impl DelegatedFixture {
+    fn authorization(&self, nonce: u64, expiry_ledger: u32) -> DelegatedVaultAuthorization {
+        DelegatedVaultAuthorization {
+            user: self.user.clone(),
+            merchant: self.merchant.clone(),
+            token: self.token.clone(),
+            amount: 20_000_000,
+            interval_ledgers: 17_280,
+            nonce,
+            expiry_ledger,
+        }
+    }
+
+    fn sign(&self, authorization: &DelegatedVaultAuthorization) -> BytesN<64> {
+        self.sign_with(&self.signing_key, authorization)
+    }
+
+    fn sign_with(
+        &self,
+        key: &ed25519_dalek::SigningKey,
+        authorization: &DelegatedVaultAuthorization,
+    ) -> BytesN<64> {
+        let digest = self.env.as_contract(&self.contract_id, || {
+            delegated_vault_digest(&self.env, authorization)
+        });
+        meta_signature(&self.env, key, &digest)
+    }
+}
+
+#[test]
+fn test_delegated_vault_creation_needs_only_the_subscriber_signature() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    let signature = f.sign(&authorization);
+
+    f.orbit.create_vault_delegated(&authorization, &signature);
+
+    let vault = f
+        .orbit
+        .get_vault(&f.user, &f.merchant)
+        .expect("vault created");
+    assert_eq!(vault.token, f.token);
+    assert_eq!(vault.amount_per_interval, 20_000_000);
+    assert_eq!(vault.interval_seconds, 17_280 * SECONDS_PER_LEDGER);
+    assert_eq!(vault.grace_period_seconds, DEFAULT_GRACE_PERIOD_SECONDS);
+    assert_eq!(vault.payment_status, PAYMENT_ACTIVE);
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 1);
+    // No authorization was recorded for anyone: the relayer paid, the
+    // subscriber only signed the payload.
+    assert!(f.env.auths().is_empty());
+}
+
+#[test]
+fn test_delegated_vault_emits_event() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    f.orbit
+        .create_vault_delegated(&authorization, &f.sign(&authorization));
+
+    let topics = soroban_sdk::vec![
+        &f.env,
+        Symbol::new(&f.env, "vault_delegated").to_val(),
+        f.user.clone().to_val(),
+        f.merchant.clone().to_val(),
+    ];
+    let data = (f.token.clone(), 20_000_000i128, 17_280u32, 0u64).into_val(&f.env);
+    // The standard vault_created event comes first, so existing indexers see a
+    // delegated vault exactly like any other; vault_delegated follows.
+    let created_topics = soroban_sdk::vec![
+        &f.env,
+        Symbol::new(&f.env, "vault_created").to_val(),
+        f.user.clone().to_val(),
+        f.merchant.clone().to_val(),
+    ];
+    let created_data = (
+        f.token.clone(),
+        20_000_000i128,
+        17_280u64 * SECONDS_PER_LEDGER,
+        0u64,
+        0i128,
+    )
+        .into_val(&f.env);
+    assert_eq!(
+        f.env.events().all().filter_by_contract(&f.contract_id),
+        soroban_sdk::vec![
+            &f.env,
+            (f.contract_id.clone(), created_topics, created_data),
+            (f.contract_id.clone(), topics, data)
+        ]
+    );
+}
+
+#[test]
+fn test_delegated_vault_rejects_replayed_signature() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    let signature = f.sign(&authorization);
+    f.orbit.create_vault_delegated(&authorization, &signature);
+
+    let replay = f
+        .orbit
+        .try_create_vault_delegated(&authorization, &signature);
+    assert_eq!(replay, Err(Ok(DelegatedAuthError::InvalidNonce)));
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 1);
+}
+
+#[test]
+fn test_delegated_vault_rejects_a_nonce_that_is_not_current() {
+    let f = delegated_fixture();
+    // Signed ahead of time for nonce 3 while the subscriber is still at 0.
+    let future = f.authorization(3, 200);
+    assert_eq!(
+        f.orbit
+            .try_create_vault_delegated(&future, &f.sign(&future)),
+        Err(Ok(DelegatedAuthError::InvalidNonce))
+    );
+    assert!(f.orbit.get_vault(&f.user, &f.merchant).is_none());
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 0);
+}
+
+#[test]
+fn test_delegated_vault_rejects_expired_signature() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 150);
+    let signature = f.sign(&authorization);
+
+    f.env.ledger().set_sequence_number(151);
+    assert_eq!(
+        f.orbit
+            .try_create_vault_delegated(&authorization, &signature),
+        Err(Ok(DelegatedAuthError::SignatureExpired))
+    );
+    assert!(f.orbit.get_vault(&f.user, &f.merchant).is_none());
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 0);
+}
+
+#[test]
+fn test_delegated_vault_accepts_signature_on_its_expiry_ledger() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 150);
+    let signature = f.sign(&authorization);
+
+    f.env.ledger().set_sequence_number(150);
+    f.orbit.create_vault_delegated(&authorization, &signature);
+    assert!(f.orbit.get_vault(&f.user, &f.merchant).is_some());
+}
+
+#[test]
+fn test_delegated_vault_rejects_signature_from_another_key() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    let (mallory, _) = meta_signer(&f.env, 99);
+    let forged = f.sign_with(&mallory, &authorization);
+
+    // The host's Ed25519 check aborts the call; nothing is written.
+    let result = f.orbit.try_create_vault_delegated(&authorization, &forged);
+    assert!(matches!(result, Err(Err(_))), "{result:?}");
+    assert!(f.orbit.get_vault(&f.user, &f.merchant).is_none());
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 0);
+}
+
+#[test]
+fn test_delegated_vault_rejects_garbage_signature() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    let garbage = BytesN::from_array(&f.env, &[7u8; 64]);
+    assert!(f
+        .orbit
+        .try_create_vault_delegated(&authorization, &garbage)
+        .is_err());
+    assert!(f.orbit.get_vault(&f.user, &f.merchant).is_none());
+}
+
+#[test]
+fn test_delegated_vault_rejects_tampered_terms() {
+    let f = delegated_fixture();
+    let signed = f.authorization(0, 200);
+    let signature = f.sign(&signed);
+
+    // A relayer raising the amount, swapping the token or redirecting the
+    // merchant invalidates the subscriber's signature.
+    let mut more = signed.clone();
+    more.amount = 999_000_000;
+    let mut other_token = signed.clone();
+    other_token.token = f
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&f.env))
+        .address();
+    let mut other_merchant = signed.clone();
+    other_merchant.merchant = Address::generate(&f.env);
+    let mut longer_expiry = signed.clone();
+    longer_expiry.expiry_ledger = 10_000;
+
+    for tampered in [more, other_token, other_merchant, longer_expiry] {
+        assert!(f
+            .orbit
+            .try_create_vault_delegated(&tampered, &signature)
+            .is_err());
+        assert!(f.orbit.get_vault(&f.user, &tampered.merchant).is_none());
+    }
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 0);
+}
+
+#[test]
+fn test_delegated_signature_is_bound_to_one_contract() {
+    let f = delegated_fixture();
+    let authorization = f.authorization(0, 200);
+    let signature = f.sign(&authorization);
+
+    let other_id = f.env.register(OrbitContract, ());
+    let other = OrbitContractClient::new(&f.env, &other_id);
+    assert!(other
+        .try_create_vault_delegated(&authorization, &signature)
+        .is_err());
+    assert!(other.get_vault(&f.user, &f.merchant).is_none());
+}
+
+#[test]
+fn test_delegated_vault_rejects_non_account_subscriber() {
+    let f = delegated_fixture();
+    let mut authorization = f.authorization(0, 200);
+    // A contract address has no Ed25519 key that could have signed.
+    authorization.user = f.contract_id.clone();
+    assert_eq!(
+        f.orbit
+            .try_create_vault_delegated(&authorization, &BytesN::from_array(&f.env, &[0u8; 64])),
+        Err(Ok(DelegatedAuthError::InvalidSignature))
+    );
+}
+
+#[test]
+fn test_delegated_vault_rejects_invalid_terms_before_verifying() {
+    let f = delegated_fixture();
+    let mut zero_amount = f.authorization(0, 200);
+    zero_amount.amount = 0;
+    let mut zero_interval = f.authorization(0, 200);
+    zero_interval.interval_ledgers = 0;
+    for authorization in [zero_amount, zero_interval] {
+        assert_eq!(
+            f.orbit
+                .try_create_vault_delegated(&authorization, &f.sign(&authorization)),
+            Err(Ok(DelegatedAuthError::InvalidAuthorization))
+        );
+    }
+}
+
+#[test]
+fn test_delegated_and_meta_signatures_share_one_nonce() {
+    let f = delegated_fixture();
+    // A #207 meta-transaction signed for nonce 0 ...
+    f.env.ledger().set_timestamp(1_000);
+    let meta_digest = f.env.as_contract(&f.contract_id, || {
+        create_vault_meta_digest(&f.env, &f.user, &f.merchant, &f.token, 29, 86_400, 0, 2_000)
+    });
+    let meta_sig = meta_signature(&f.env, &f.signing_key, &meta_digest);
+
+    // ... stops working once a delegated authorization consumes nonce 0.
+    let authorization = f.authorization(0, 200);
+    f.orbit
+        .create_vault_delegated(&authorization, &f.sign(&authorization));
+    assert!(f
+        .orbit
+        .try_create_vault_with_signature(
+            &f.user,
+            &f.merchant,
+            &f.token,
+            &29,
+            &86_400,
+            &2_000,
+            &meta_sig
+        )
+        .is_err());
+    assert_eq!(f.orbit.get_user_nonce(&f.user), 1);
+}

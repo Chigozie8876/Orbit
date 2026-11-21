@@ -31,6 +31,22 @@ function errorMessage(error) {
     const first = error.issues[0];
     return `Invalid input on ${first.path.join('.') || 'input'}: ${first.message}`;
 }
+/**
+ * Why a coupon cannot be redeemed now, or null when it can (#299). Lets checkout
+ * tell an expired code apart from a mistyped or used-up one.
+ */
+function couponUnavailableReason(coupon, now = Date.now()) {
+    if (!coupon || coupon.active === false) return 'invalid';
+    if (coupon.expires_at && Date.parse(coupon.expires_at) <= now) return 'expired';
+    if (coupon.max_redemptions != null && Number(coupon.redemptions_count) >= Number(coupon.max_redemptions)) return 'exhausted';
+    return null;
+}
+const UNAVAILABLE_MESSAGES = {
+    invalid: 'This promo code is not valid.',
+    expired: 'This promo code has expired.',
+    exhausted: 'This promo code has reached its redemption limit.',
+    not_applicable: 'This promo code cannot be applied to this plan.',
+};
 function couponIsValid(coupon, now = Date.now()) {
     return Boolean(coupon && coupon.active !== false &&
         (!coupon.expires_at || Date.parse(coupon.expires_at) > now) &&
@@ -123,9 +139,10 @@ function registerCouponRoutes(app, getSupabase, authenticateMerchant) {
         }
     });
 
-    app.post('/coupons/validate', async (req, res) => {
+    // POST /api/promo/validate is the checkout widget's name for the same check (#299)
+    const validateCoupon = async (req, res) => {
         const parsed = validationSchema.safeParse(req.body);
-        if (!parsed.success) return res.status(400).json({ error: errorMessage(parsed.error) });
+        if (!parsed.success) return res.status(400).json({ valid: false, reason: 'invalid', error: errorMessage(parsed.error) });
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
         try {
@@ -136,10 +153,11 @@ function registerCouponRoutes(app, getSupabase, authenticateMerchant) {
             const { data: coupon, error } = await supabase.from('coupons')
                 .select('*').eq('merchant_id', plan.merchant_id).eq('code', normalizeCode(parsed.data.code)).maybeSingle();
             if (error) throw error;
-            if (!couponIsValid(coupon) || coupon.merchant_id !== plan.merchant_id) return res.status(422).json({ valid: false, error: 'Coupon is invalid or unavailable' });
+            const reason = coupon && coupon.merchant_id !== plan.merchant_id ? 'invalid' : couponUnavailableReason(coupon);
+            if (reason) return res.status(422).json({ valid: false, reason, error: UNAVAILABLE_MESSAGES[reason] });
             let quote;
             try { quote = calculateDiscount(plan, coupon); }
-            catch { return res.status(422).json({ valid: false, error: 'Coupon is not valid for this plan' }); }
+            catch { return res.status(422).json({ valid: false, reason: 'not_applicable', error: UNAVAILABLE_MESSAGES.not_applicable }); }
             return res.json({ valid: true, code: coupon.code, ...quote, expires_at: coupon.expires_at || null,
                 // Checkout price quote only; a Stellar vault must be authorized
                 // with corresponding promo terms to enforce this on-chain.
@@ -148,7 +166,9 @@ function registerCouponRoutes(app, getSupabase, authenticateMerchant) {
             console.error('Error validating coupon:', err);
             return res.status(500).json({ error: 'Failed to validate coupon' });
         }
-    });
+    };
+    app.post('/coupons/validate', validateCoupon);
+    app.post('/api/promo/validate', validateCoupon);
 }
 
-module.exports = { registerCouponRoutes, calculateDiscount, couponIsValid, normalizeCode };
+module.exports = { registerCouponRoutes, calculateDiscount, couponIsValid, couponUnavailableReason, normalizeCode };

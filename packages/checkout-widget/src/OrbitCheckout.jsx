@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { resolveCheckoutTheme } from "./checkoutTheme";
 import { checkUsdcReadiness, usdcReadinessMessage } from "./usdcReadiness";
+import { formatPromoTerms, promoAuthorization, validatePromoCode } from "./promo";
 import { CHECKOUT_EVENTS, createCheckoutMessageBridge } from "./checkoutMessageBridge";
 import gsap from "gsap";
 import {
@@ -323,6 +324,7 @@ export default function OrbitCheckout({
       });
     } else if (type === "orbit:close") {
       checkoutBridge.current?.send({ type: CHECKOUT_EVENTS.closed });
+    }
     if (typeof window === 'undefined') return;
     const normalizedType = type === 'orbit:subscribed' ? 'orbit:success' : type;
     window.dispatchEvent(new CustomEvent(normalizedType, {
@@ -391,36 +393,21 @@ export default function OrbitCheckout({
     }
   };
 
-  // USDC plans quote raw 7-decimal token units; fiat plans quote major units directly.
-  const formatPlanAmount = (amount, currency) =>
-    (currency === "USDC" ? Number(amount) / 10000000 : Number(amount)).toFixed(
-      2,
-    );
-
+  // #299: validation reports a specific reason (invalid, expired, used up, not
+  // applicable) and leaves the typed code in place so it can be corrected.
   const applyCoupon = async () => {
     const code = couponCode.trim();
     if (!code) return;
     setCouponApplying(true);
     setCouponError("");
-    try {
-      const response = await fetch(`${apiUrl}/coupons/validate`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ plan_id: plan.id || planId, code }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || !payload.valid) {
-        throw new Error(
-          payload.error || "This coupon code is not valid for this plan.",
-        );
-      }
-      setAppliedCoupon(payload);
-    } catch (reason) {
+    const result = await validatePromoCode({ apiUrl, planId: plan.id || planId, code });
+    if (result.ok) {
+      setAppliedCoupon(result.quote);
+    } else {
       setAppliedCoupon(null);
-      setCouponError(reason.message || "Could not validate this coupon code.");
-    } finally {
-      setCouponApplying(false);
+      setCouponError(result.message);
     }
+    setCouponApplying(false);
   };
 
   const removeCoupon = () => {
@@ -1155,6 +1142,8 @@ export default function OrbitCheckout({
       }
 
       const activeWallet = passkeyAdapter || StellarWalletsKit;
+      // #299: with a promo, the vault and allowance follow the discounted schedule
+      const authTerms = promoAuthorization(plan, appliedCoupon);
       setConfirming(true);
       setConfirmingSeconds(60);
 
@@ -1166,13 +1155,13 @@ export default function OrbitCheckout({
             wallet: activeWallet,
             address,
             merchantAddress: plan.merchants.wallet_address,
-            amount: plan.usdc_amount,
+            amount: authTerms.amount,
             intervalSeconds: plan.interval_seconds,
             orbitContractId,
             settlementTokenContractId: tokenContractId,
             rpcUrl,
             networkPassphrase,
-            billingCycles: 12,
+            billingCycles: authTerms.billingCycles,
             paymentTokenContractId: assetContractId(
               selectedPayWith,
               networkPassphrase,
@@ -1202,8 +1191,9 @@ export default function OrbitCheckout({
           wallet: activeWallet,
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1230,8 +1220,9 @@ export default function OrbitCheckout({
         const preflight = await preflightPlan({
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1242,8 +1233,9 @@ export default function OrbitCheckout({
           wallet: activeWallet,
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1374,13 +1366,15 @@ export default function OrbitCheckout({
     1,
     Math.round(Number(plan.interval_seconds) / 86400),
   );
-  const couponDiscountPct = appliedCoupon
-    ? Math.round(
-        (Number(appliedCoupon.savings) /
-          Number(appliedCoupon.original_amount)) *
-          100,
-      )
-    : 0;
+  // #299: badge text and the allowance the subscriber is about to sign
+  const promoTerms = appliedCoupon ? formatPromoTerms(appliedCoupon) : null;
+  let promoAllowanceUsdc = null;
+  try {
+    const terms = appliedCoupon ? promoAuthorization(plan, appliedCoupon) : null;
+    if (terms) promoAllowanceUsdc = { total: (Number(terms.allowance) / 10000000).toFixed(2), cycles: terms.billingCycles };
+  } catch {
+    promoAllowanceUsdc = null;
+  }
 
   return (
     <section
@@ -1440,26 +1434,24 @@ export default function OrbitCheckout({
         <h2>{plan.name}</h2>
       </div>
 
-      {appliedCoupon ? (
-        <p style={styles.price}>
-          <span className="orbit-price-original">
-            $
-            {formatPlanAmount(
-              appliedCoupon.original_amount,
-              appliedCoupon.currency,
-            )}{" "}
-            {appliedCoupon.currency}
-          </span>
-          $
-          {formatPlanAmount(
-            appliedCoupon.discounted_amount,
-            appliedCoupon.currency,
-          )}{" "}
-          {appliedCoupon.currency}
-          <span className="orbit-discount-pill">
-            {couponDiscountPct}% OFF applied
-          </span>
-        </p>
+      {promoTerms ? (
+        <>
+          <p style={styles.price} aria-label={`${promoTerms.original} ${promoTerms.currency} reduced to ${promoTerms.discounted} ${promoTerms.currency} ${promoTerms.period}`}>
+            <s className="orbit-price-original">
+              {promoTerms.original} {promoTerms.currency}
+            </s>{" "}
+            {promoTerms.discounted} {promoTerms.currency}
+            <span className="orbit-discount-pill">
+              {promoTerms.badge} {promoTerms.period}
+            </span>
+          </p>
+          <p style={{ fontSize: 13, margin: "4px 0 0", color: "var(--orbit-muted, #6b7280)" }}>
+            Then {promoTerms.original} {promoTerms.currency} per cycle. You will be asked to approve the regular price when the promotion ends.
+            {promoAllowanceUsdc && (
+              <> This authorization allows up to {promoAllowanceUsdc.total} USDC over {promoAllowanceUsdc.cycles} {promoAllowanceUsdc.cycles === 1 ? "cycle" : "cycles"}.</>
+            )}
+          </p>
+        </>
       ) : (
         <p style={styles.price}>${planAmountUsdc} USDC</p>
       )}
@@ -1474,16 +1466,13 @@ export default function OrbitCheckout({
               className="orbit-coupon-toggle"
               onClick={() => setCouponOpen(true)}
             >
-              Have a coupon code?
+              Have a promo code?
             </button>
           )}
           {appliedCoupon && (
             <p style={{ fontSize: 13, color: "var(--orbit-text)", margin: 0 }}>
-              Coupon <strong>{appliedCoupon.code}</strong> applied
-              {appliedCoupon.duration_months > 1
-                ? ` for ${appliedCoupon.duration_months} months`
-                : ""}
-              .{" "}
+              Promo <strong>{appliedCoupon.code}</strong> applied{" "}
+              {promoTerms?.period}.{" "}
               <button
                 type="button"
                 className="orbit-coupon-toggle"
@@ -1497,8 +1486,10 @@ export default function OrbitCheckout({
             <div className="orbit-coupon-row">
               <input
                 type="text"
-                placeholder="Coupon code"
-                aria-label="Coupon code"
+                placeholder="Promo code"
+                aria-label="Promo code"
+                aria-invalid={couponError ? "true" : "false"}
+                aria-describedby={couponError ? "orbit-promo-error" : undefined}
                 value={couponCode}
                 onChange={(e) => {
                   setCouponCode(e.target.value);
@@ -1533,7 +1524,7 @@ export default function OrbitCheckout({
             </div>
           )}
           {couponError && (
-            <div className="orbit-field-error" role="alert">
+            <div id="orbit-promo-error" className="orbit-field-error" role="alert">
               {couponError}
             </div>
           )}

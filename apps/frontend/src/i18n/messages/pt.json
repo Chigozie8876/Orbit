@@ -161,7 +161,8 @@
       "settled": "Total liquidado",
       "nextPull": "Próxima cobrança",
       "status": "Status do cofre",
-      "actions": "Ações"
+      "actions": "Ações",
+      "health": "Saúde"
     },
     "payroll": {
       "contractor": "Prestador",
@@ -290,5 +291,46 @@
     "confirmedOneTime": "Sua autorização única está ativa na Stellar testnet.",
     "viewTx": "Ver transação",
     "returnToMerchant": "Voltar ao lojista"
+  },
+  "SubscriberHealth": {
+    "level": {
+      "good": "BOA",
+      "warning": "ALERTA",
+      "critical": "CRÍTICA"
+    },
+    "notScored": "—",
+    "noRisk": "Nenhum risco de renovação: saldo, autorização e cobranças recentes estão saudáveis.",
+    "factors": {
+      "insufficient_balance": "Saldo de USDC insuficiente detectado on-chain: a carteira não cobre a próxima cobrança de {amount} USDC.",
+      "low_balance": "Saldo de USDC baixo on-chain ({balance} USDC): cobre no máximo mais uma cobrança de {amount} USDC.",
+      "allowance_exhausted": "A autorização do cofre acabou: a Orbit não pode cobrar o próximo pagamento até o assinante renová-la.",
+      "allowance_low": "A autorização do cofre cobre apenas {cycles, plural, =0 {nenhum ciclo a mais} one {# ciclo a mais} other {# ciclos a mais}}.",
+      "allowance_expired": "A autorização do cofre expirou: a última cobrança foi recusada on-chain.",
+      "pull_failures": "{count, plural, one {# cobrança recente falhou} other {# cobranças recentes falharam}}.",
+      "past_due": "O pagamento está atrasado e em novas tentativas de cobrança.",
+      "due_soon": "A renovação vence {hours, plural, =0 {agora} one {em # hora} other {em # horas}}, sem tempo para o problema se resolver sozinho."
+    },
+    "card": {
+      "title": "{count, plural, one {# assinante em risco de cancelamento} other {# assinantes em risco de cancelamento}}",
+      "subtitle": "Renovações que provavelmente falharão por saldo baixo, autorização esgotada ou cobranças com falhas repetidas.",
+      "critical": "{count} críticos",
+      "warning": "{count} em alerta",
+      "revenueLabel": "Receita em risco no próximo ciclo",
+      "criticalRevenue": "{amount} USDC de assinantes críticos",
+      "viewAtRisk": "Ver assinantes em risco",
+      "showAll": "Mostrar todos os assinantes",
+      "allHealthy": "{count, plural, one {O assinante com renovação está saudável.} other {Os # assinantes com renovação estão saudáveis.}}"
+    },
+    "reminder": {
+      "send": "Lembrar",
+      "sending": "Enviando…",
+      "title": "Enviar ao assinante um link para recarregar a carteira ou renovar a autorização",
+      "sent": "Lembrete de saldo enviado para {recipient}.",
+      "demoRecipient": "o assinante de demonstração",
+      "failed": "Lembrete não enviado: {error}",
+      "noEmail": "Nenhum e-mail registrado: o assinante não informou um no checkout.",
+      "cooldown": "Um lembrete já foi enviado nas últimas 24 horas.",
+      "dismiss": "Fechar"
+    }
   }
 }

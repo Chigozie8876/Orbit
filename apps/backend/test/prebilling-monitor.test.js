@@ -185,4 +185,55 @@ describe('Pre-billing liquidity monitor (#208)', () => {
     expect(result.warnings).toEqual([]);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('records the liquidity snapshot on the subscription for the dashboard (#298)', async () => {
+    const db = seedDb([makeSubscription({ metadata: { customer_email: 'sub@example.com' } })]);
+    await runPreBillingScan(db, {
+      now: new Date('2026-01-01T00:00:00Z'),
+      chain: makeChain('100000000', '600000000'),
+      fetchImpl: makeFetch(),
+    });
+
+    const [row] = db.tables.subscriptions;
+    expect(row.metadata).toEqual({
+      customer_email: 'sub@example.com',
+      liquidity: {
+        balance: '100000000',
+        allowance: '600000000',
+        required_amount: '290000000',
+        low_balance: true,
+        allowance_expiring: false,
+        checked_at: '2026-01-01T00:00:00.000Z',
+      },
+    });
+  });
+
+  it('records a healthy snapshot too, so the dashboard can show it as good', async () => {
+    const db = seedDb([makeSubscription()]);
+    await runPreBillingScan(db, {
+      now: new Date('2026-01-01T00:00:00Z'),
+      chain: makeChain('900000000', '900000000'),
+      fetchImpl: makeFetch(),
+    });
+    expect(db.tables.subscriptions[0].metadata.liquidity).toMatchObject({ low_balance: false, allowance_expiring: false });
+  });
+
+  it('keeps scanning when the snapshot cannot be written', async () => {
+    const db = seedDb([makeSubscription()]);
+    const realFrom = db.from.bind(db);
+    db.from = (table) => {
+      const builder = realFrom(table);
+      if (table === 'subscriptions') builder.update = () => ({ eq: async () => ({ error: { message: 'write failed' } }) });
+      return builder;
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await runPreBillingScan(db, {
+      now: new Date('2026-01-01T00:00:00Z'),
+      chain: makeChain('0', '290000000'),
+      fetchImpl: makeFetch(),
+    });
+    expect(result.warnings).toHaveLength(1);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
 });
