@@ -45,6 +45,8 @@ export interface OrbitCheckoutProps {
   customClasses?: OrbitCustomClasses;
   allowedOrigins?: string[];
   customFields?: OrbitCustomField[];
+  captureEmail?: boolean;
+  onSuccess?: (event: OrbitSubscribedEvent & { email?: string }) => void;
   walletConnectProjectId?: string;
   termsUrl?: string;
   privacyUrl?: string;

@@ -83,6 +83,12 @@ interface RowValidationError {
   reason: string;
 }
 
+export interface PayrollViewProps {
+  autoOpenUpload?: boolean;
+  onUploadOpened?: () => void;
+}
+
+export function PayrollView({ autoOpenUpload, onUploadOpened }: PayrollViewProps = {}) {
 export interface MultiSigSigner {
   address: string;
   name: string;
@@ -307,6 +313,14 @@ export function PayrollView() {
       );
     }, 1400);
   };
+
+  useEffect(() => {
+    if (autoOpenUpload) {
+      // Trigger file picker for payroll CSV upload
+      fileInputRef.current?.click();
+      onUploadOpened?.();
+    }
+  }, [autoOpenUpload, onUploadOpened]);
 
   useEffect(() => {
     setContractors([]); setBookError("");
