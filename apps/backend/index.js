@@ -94,6 +94,8 @@ const { registerCredentialRoutes } = require('./credentials');
 const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
 const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
+const { createEmailDispatcher, sendSettlementReceipt } = require('./receipt-email');
+const { getSharedRpcPool } = require('./rpc-pool');
 const { registerDevFundingRoutes } = require('./dev-faucet');
 const {
     createRemoteMerchantSigner,
@@ -190,7 +192,15 @@ registerDevFundingRoutes(app, {
 });
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
-const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
+let defaultRpcPool;
+const getSorobanServer = (rpcUrl) => {
+    if (app.locals.sorobanServer) return app.locals.sorobanServer;
+    if (process.env.SOROBAN_RPC_SERVERS) {
+        defaultRpcPool ??= getSharedRpcPool();
+        return defaultRpcPool.proxy();
+    }
+    return new rpc.Server(rpcUrl);
+};
 
 // One relayer per process: its sequence cache and channel pool must be shared by all requests.
 // Tests inject their own through app.locals.relayer.
@@ -702,10 +712,24 @@ const applyPullOutcome = async ({
                 if (payment) {
                     try {
                         const invoiceService = app.locals.invoiceService || createInvoiceService({ supabase });
-                        await invoiceService.createForSettledPayment({
+                        const receipt = await invoiceService.createForSettledPayment({
                             payment, merchant, plan: sub.plans, subscription: sub,
                             ledgerSequence: confirmation?.ledger ?? confirmation?.ledgerSequence ?? null,
                         });
+                        if (receipt?.invoice && receipt?.pdf) {
+                            const dispatcher = app.locals.receiptEmailDispatcher || createEmailDispatcher({
+                                fetchImpl: app.locals.fetchImpl || globalThis.fetch,
+                            });
+                            await sendSettlementReceipt({
+                                dispatcher,
+                                invoice: receipt.invoice,
+                                payment,
+                                merchant,
+                                plan: sub.plans,
+                                subscription: sub,
+                                pdf: receipt.pdf,
+                            });
+                        }
                     } catch (invoiceError) {
                         console.error('Invoice generation failed:', invoiceError);
                     }
@@ -1038,6 +1062,7 @@ app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req
         const relayer = getRelayer();
         if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
 
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
