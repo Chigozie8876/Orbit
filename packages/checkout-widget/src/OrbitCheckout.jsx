@@ -41,6 +41,8 @@ export default function OrbitCheckout({
   customClasses = {},
   allowedOrigins = [],
   customFields = [],
+  captureEmail = false,
+  onSuccess,
 }) {
   const walletChoices = useMemo(() => WALLET_MODULES.filter(([id]) => allowedWallets.includes(id)), [allowedWallets]);
   const [plan, setPlan] = useState(planData || null);
@@ -55,6 +57,55 @@ export default function OrbitCheckout({
   const [pending, setPending] = useState(null);
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
+
+  // Connection monitoring & offline detection (#310)
+  const [isOnline, setIsOnline] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean'
+      ? navigator.onLine
+      : true;
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      setError((prev) => (prev?.toLowerCase().includes('offline') ? '' : prev));
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Custom Receipt Email Capture (#311)
+  const REMEMBER_EMAIL_KEY = 'orbit:remembered-email';
+  const [customerEmail, setCustomerEmail] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return localStorage.getItem(REMEMBER_EMAIL_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [rememberEmail, setRememberEmail] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return !!localStorage.getItem(REMEMBER_EMAIL_KEY);
+    } catch {
+      return false;
+    }
+  });
+  const [emailError, setEmailError] = useState('');
 
   // Custom Form Fields & Validation
   const [formData, setFormData] = useState({});
@@ -265,8 +316,9 @@ export default function OrbitCheckout({
       localStorage.setItem(STORAGE_KEY, PASSKEY_WALLET_ID);
       dispatch('orbit:wallet_connected', { address: passkeyAddress, type: 'passkey', isNew });
     } catch (reason) {
-      const message = reason?.message || 'Biometric passkey authentication failed.';
+      const message = reason?.message || 'Passkey authentication failed or was cancelled.';
       setError(message);
+      setShowWallets(true);
       dispatch('orbit:error', { message });
     }
   };
@@ -283,7 +335,34 @@ export default function OrbitCheckout({
   };
 
   const subscribe = async () => {
+    if (!isOnline) {
+      setError('You are currently offline. Please reconnect to the internet to complete your subscription.');
+      return;
+    }
     if (!validateForm()) return;
+
+    if (captureEmail) {
+      const trimmed = (customerEmail || '').trim();
+      if (!trimmed) {
+        setEmailError('Please enter your email address for your subscription receipt.');
+        return;
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+        setEmailError('Please enter a valid email address.');
+        return;
+      }
+      setEmailError('');
+      if (rememberEmail) {
+        try {
+          localStorage.setItem(REMEMBER_EMAIL_KEY, trimmed);
+        } catch {}
+      } else {
+        try {
+          localStorage.removeItem(REMEMBER_EMAIL_KEY);
+        } catch {}
+      }
+    }
+
     if (isWrongNetwork) {
       setError('Please switch to the matching network before subscribing.');
       return;
@@ -299,6 +378,7 @@ export default function OrbitCheckout({
 
       const activeWallet = passkeyAdapter || StellarWalletsKit;
       const preflight = await preflightPlan({
+        wallet: activeWallet,
         address,
         merchantAddress: plan.merchants.wallet_address,
         amount: plan.usdc_amount,
@@ -331,13 +411,18 @@ export default function OrbitCheckout({
         onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
       });
 
+      const finalMetadata = {
+        ...formData,
+        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+      };
+
       const response = await fetch(`${apiUrl}/subscriptions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           plan_id: plan.id || planId,
           customer_wallet_address: address,
-          metadata: formData,
+          metadata: finalMetadata,
         }),
       });
 
@@ -346,12 +431,15 @@ export default function OrbitCheckout({
       localStorage.removeItem(PENDING_KEY);
       setPending(null);
       setReceipt(hashes);
-      dispatch('orbit:subscribed', {
+      const subscriptionEventPayload = {
         subscriptionId: subscription.id,
         planId: plan.id || planId,
         txHash: hashes.vaultHash,
-        metadata: formData,
-      });
+        metadata: finalMetadata,
+        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+      };
+      dispatch('orbit:subscribed', subscriptionEventPayload);
+      onSuccess?.(subscriptionEventPayload);
     } catch (reason) {
       if (reason instanceof PendingTransactionError) {
         setPending({ stage: 'transaction', hash: reason.hash });
@@ -448,6 +536,62 @@ export default function OrbitCheckout({
         </div>
       )}
 
+      {/* Custom Receipt Email Capture (#311) */}
+      {captureEmail && !receipt && (
+        <div className="orbit-field" style={{ marginTop: 16, marginBottom: 16 }}>
+          <label htmlFor="orbit-receipt-email">
+            Receipt Email Address <span style={{ color: 'var(--orbit-error)' }}>*</span>
+          </label>
+          <input
+            id="orbit-receipt-email"
+            type="email"
+            placeholder="you@example.com"
+            value={customerEmail}
+            onChange={(e) => {
+              setCustomerEmail(e.target.value);
+              if (emailError) setEmailError('');
+            }}
+            disabled={processing || confirming || !isOnline}
+            autoComplete="email"
+          />
+          {emailError && (
+            <div className="orbit-field-error" role="alert">
+              {emailError}
+            </div>
+          )}
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', fontSize: '12px', color: 'var(--orbit-muted)', cursor: 'pointer', fontWeight: 'normal' }}>
+            <input
+              type="checkbox"
+              checked={rememberEmail}
+              onChange={(e) => setRememberEmail(e.target.checked)}
+              disabled={processing || confirming}
+              style={{ width: 'auto', margin: 0 }}
+            />
+            Remember my email for future checkouts
+          </label>
+        </div>
+      )}
+
+      {/* Offline Warning Banner (#310) */}
+      {!isOnline && (
+        <div role="alert" className="orbit-offline-banner" style={{
+          margin: '16px 0',
+          padding: '12px 14px',
+          border: '1px solid #ef4444',
+          borderRadius: 'var(--orbit-radius)',
+          background: actualTheme === 'dark' ? 'rgba(239, 68, 68, 0.15)' : '#fef2f2',
+          color: actualTheme === 'dark' ? '#fca5a5' : '#991b1b',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+            <strong style={{ fontSize: '13px' }}>Network Connection Unavailable</strong>
+          </div>
+          <p style={{ margin: 0, fontSize: '12px', lineHeight: 1.4 }}>
+            You are currently offline. Authorization cannot proceed until internet connectivity is restored.
+          </p>
+        </div>
+      )}
+
       {/* Wrong Network Warning Banner */}
       {isWrongNetwork && (
         <div role="alert" className="orbit-wrong-network">
@@ -525,24 +669,33 @@ export default function OrbitCheckout({
             {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
             <button
               className={customClasses.button}
-              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1 }}
-              disabled={processing || isWrongNetwork}
+              style={{ ...styles.button, opacity: (isWrongNetwork || !isOnline) ? 0.6 : 1 }}
+              disabled={processing || isWrongNetwork || !isOnline}
               onClick={subscribe}
             >
-              {processing
+              {!isOnline
+                ? 'Network Connection Unavailable'
+                : processing
                 ? 'Preparing transaction...'
                 : isWrongNetwork
                 ? `Switch to ${targetNetworkName} to continue`
                 : isDemo
                 ? 'Preview success state'
-                : 'Subscribe & Approve'}
+                : passkeyAdapter
+                ? 'Sign with Passkey'
+                : 'Authorize Subscription'}
             </button>
             <button style={styles.cancel} onClick={handleOpenWallets}>Switch wallet</button>
             <button style={styles.cancel} onClick={disconnect}>Disconnect</button>
           </>
         ) : (
-          <button className={customClasses.button} style={styles.button} onClick={handleOpenWallets}>
-            Connect wallet
+          <button
+            className={customClasses.button}
+            style={{ ...styles.button, opacity: !isOnline ? 0.6 : 1 }}
+            disabled={!isOnline}
+            onClick={handleOpenWallets}
+          >
+            {!isOnline ? 'Network Connection Unavailable' : 'Connect wallet'}
           </button>
         ))
       )}
@@ -554,7 +707,7 @@ export default function OrbitCheckout({
         <div role="dialog" aria-modal="true" aria-labelledby="wallet-title" style={styles.dialog}>
           <h3 id="wallet-title">Choose Payment Method</h3>
 
-          {/* Biometric Passkey Option */}
+          {/* Biometric Passkey Option (#309) */}
           {hasPasskey && (
             <button
               style={{
@@ -566,9 +719,9 @@ export default function OrbitCheckout({
               onClick={connectPasskey}
             >
               <div style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span>🔑 Pay with Passkey / Biometrics</span>
+                <span>🔑 Sign with Passkey</span>
               </div>
-              <small style={{ color: 'var(--orbit-muted)' }}>1-touch checkout with Touch ID, Face ID or Windows Hello</small>
+              <small style={{ color: 'var(--orbit-muted)' }}>1-touch biometric authorization (Touch ID, Face ID, Windows Hello)</small>
             </button>
           )}
 

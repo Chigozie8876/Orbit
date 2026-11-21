@@ -19,7 +19,7 @@ import { SubscriptionPlan } from "../dashboard-types";
 import { CreatePlanModal } from "../modals/create-plan-modal";
 import { EmbedCodeModal } from "../modals/embed-code-modal";
 
-const INITIAL_PLANS: SubscriptionPlan[] = [
+export const INITIAL_PLANS: SubscriptionPlan[] = [
   {
     id: "plan_mailkit_pro",
     name: "MailKit Pro",

@@ -77,9 +77,12 @@ const buildPlanTransactions = ({ account, address, merchantAddress, amount, inte
   return { approve, createVault };
 };
 
-export async function preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
+export async function preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
   if (!orbitContractId || !tokenContractId) throw new Error('Missing Orbit or token contract configuration.');
   const server = new rpc.Server(rpcUrl);
+  if (wallet?.ensureAccountDeployed) {
+    await wallet.ensureAccountDeployed(server, rpcUrl);
+  }
   const account = await server.getAccount(address);
   const ledger = await server.getLatestLedger();
   const transactions = buildPlanTransactions({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: ledger.sequence, billingCycles });
@@ -109,7 +112,7 @@ export async function authorizePlan({
   onSubmitted,
   onProgress,
 }) {
-  const details = preflight || await preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles });
+  const details = preflight || await preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles });
   const { server, transactions } = details;
   const approvalHash = await signAndSubmit({ server, transaction: transactions.approve, wallet, address, networkPassphrase, stage: 'approval', onSubmitted, onProgress });
 

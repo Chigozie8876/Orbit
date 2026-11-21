@@ -73,7 +73,12 @@ interface RowValidationError {
   reason: string;
 }
 
-export function PayrollView() {
+export interface PayrollViewProps {
+  autoOpenUpload?: boolean;
+  onUploadOpened?: () => void;
+}
+
+export function PayrollView({ autoOpenUpload, onUploadOpened }: PayrollViewProps = {}) {
   const t = useTranslations("Tables");
   const { can } = useTeam();
   const canRunPayroll = can("runPayroll");
@@ -98,6 +103,14 @@ export function PayrollView() {
   const duplicates = useMemo(() => duplicateWallets(recipients), [recipients]);
   const visibleRecipients = useMemo(() => filterAndSortRecipients(recipients, deferredSearch, sortColumn, sortDirection),
     [recipients, deferredSearch, sortColumn, sortDirection]);
+
+  useEffect(() => {
+    if (autoOpenUpload) {
+      // Trigger file picker for payroll CSV upload
+      fileInputRef.current?.click();
+      onUploadOpened?.();
+    }
+  }, [autoOpenUpload, onUploadOpened]);
 
   useEffect(() => {
     setContractors([]); setBookError("");

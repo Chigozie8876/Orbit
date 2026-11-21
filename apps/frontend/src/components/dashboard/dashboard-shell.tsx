@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
@@ -27,14 +27,15 @@ import {
   UsersRound,
   Gift,
   Sparkles,
+  Search,
 } from "lucide-react";
 import { Brand } from "@/components/layout/brand";
 import { useAuth } from "@/lib/auth-context";
 import { useNotifications } from "@/lib/notification-context";
-import { DashboardTab, NetworkId, NETWORKS } from "./dashboard-types";
+import { DashboardTab, NetworkId, NETWORKS, SubscriptionPlan } from "./dashboard-types";
 import { OverviewView } from "./views/overview-view";
-import { PlansView } from "./views/plans-view";
-import { SubscribersView } from "./views/subscribers-view";
+import { PlansView, INITIAL_PLANS } from "./views/plans-view";
+import { SubscribersView, INITIAL_SUBSCRIBERS } from "./views/subscribers-view";
 import { PayrollView } from "./views/payroll-view";
 import { MultisigView } from "./views/multisig-view";
 import { GiftPassesView } from "./views/gift-passes-view";
@@ -45,6 +46,8 @@ import { TeamView } from "./views/team-view";
 import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
 import { DeployVaultModal } from "./modals/deploy-vault-modal";
+import { CreatePlanModal } from "./modals/create-plan-modal";
+import { CommandPalette } from "./modals/command-palette";
 import { NotificationDrawer } from "./drawers/notification-drawer";
 import { DOCS_URL } from "@/lib/links";
 
@@ -65,9 +68,38 @@ export function DashboardShell() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isVaultModalOpen, setIsVaultModalOpen] = useState(false);
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [isCreatePlanOpen, setIsCreatePlanOpen] = useState(false);
+  const [payrollAutoUpload, setPayrollAutoUpload] = useState(false);
+  const [plans, setPlans] = useState<SubscriptionPlan[]>(INITIAL_PLANS);
+  const [subscribers, setSubscribers] = useState(INITIAL_SUBSCRIBERS);
+  const [toastNotification, setToastNotification] = useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
   const [copiedId, setCopiedId] = useState(false);
   const [isEditingBusinessName, setIsEditingBusinessName] = useState(false);
   const [businessNameInput, setBusinessNameInput] = useState("");
+
+  // Global keyboard shortcut: Cmd+K (macOS) / Ctrl+K (Windows/Linux) (#308)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setIsCommandPaletteOpen((prev) => !prev);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  // Auto-dismiss toast after delay
+  useEffect(() => {
+    if (!toastNotification) return;
+    const timer = setTimeout(() => setToastNotification(null), 3500);
+    return () => clearTimeout(timer);
+  }, [toastNotification]);
 
   if (!user) return null;
 
@@ -83,6 +115,43 @@ export function DashboardShell() {
     navigator.clipboard.writeText(user.id);
     setCopiedId(true);
     setTimeout(() => setCopiedId(false), 2000);
+  };
+
+  const handleCreatePlan = (newPlan: SubscriptionPlan) => {
+    setPlans((prev) => [newPlan, ...prev]);
+    setToastNotification({
+      type: "success",
+      message: `Plan "${newPlan.name}" created successfully!`,
+    });
+  };
+
+  const handleDisbursePayroll = () => {
+    setActiveTab("payroll");
+    setPayrollAutoUpload(true);
+  };
+
+  const handleCopySettlementAddress = async () => {
+    const address = user?.linkedVaults?.stellar || user?.walletAddress || "";
+    if (!address) {
+      setToastNotification({
+        type: "error",
+        message: "No settlement address configured for this merchant profile",
+      });
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(address);
+      setToastNotification({
+        type: "success",
+        message: `Settlement address copied: ${address.slice(0, 6)}...${address.slice(-4)}`,
+      });
+    } catch {
+      setToastNotification({
+        type: "error",
+        message: "Failed to copy settlement address to clipboard",
+      });
+    }
   };
 
   const navItems = [
@@ -338,6 +407,20 @@ export function DashboardShell() {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Quick Search / Command Palette Trigger (#308) */}
+            <button
+              onClick={() => setIsCommandPaletteOpen(true)}
+              className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-black/10 hover:border-black/25 bg-neutral-50 hover:bg-neutral-100 text-xs text-neutral-500 transition-colors"
+              title="Open Command Palette (⌘K / Ctrl+K)"
+              aria-label="Open Command Palette"
+            >
+              <Search size={14} className="text-neutral-400" />
+              <span>Search commands...</span>
+              <kbd className="ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded bg-white border border-black/10 text-neutral-500 shadow-2xs">
+                ⌘K
+              </kbd>
+            </button>
+
             <button
               onClick={toggleDrawer}
               className="relative p-2 rounded-lg border border-black/10 hover:border-black/25 bg-white text-neutral-600 hover:text-black transition-colors"
@@ -399,7 +482,12 @@ export function DashboardShell() {
 
           {activeTab === "subscribers" && <SubscribersView />}
 
-          {activeTab === "payroll" && <PayrollView />}
+          {activeTab === "payroll" && (
+            <PayrollView
+              autoOpenUpload={payrollAutoUpload}
+              onUploadOpened={() => setPayrollAutoUpload(false)}
+            />
+          )}
 
           {activeTab === "multisig" && <MultisigView />}
 
@@ -417,6 +505,29 @@ export function DashboardShell() {
         </main>
       </div>
 
+      {/* Global Dashboard Command Palette (#308) */}
+      <CommandPalette
+        isOpen={isCommandPaletteOpen}
+        onClose={() => setIsCommandPaletteOpen(false)}
+        onNavigate={(tab) => {
+          setActiveTab(tab);
+          setIsMobileMenuOpen(false);
+        }}
+        onOpenCreatePlan={() => setIsCreatePlanOpen(true)}
+        onDisbursePayroll={handleDisbursePayroll}
+        onCopySettlementAddress={handleCopySettlementAddress}
+        plans={plans}
+        subscribers={subscribers}
+        settlementAddress={user.linkedVaults?.stellar || user.walletAddress || ""}
+      />
+
+      {/* Create Plan Modal (#308 Quick Action) */}
+      <CreatePlanModal
+        isOpen={isCreatePlanOpen}
+        onClose={() => setIsCreatePlanOpen(false)}
+        onCreatePlan={handleCreatePlan}
+      />
+
       {/* Vault Management Modal */}
       <VaultModal
         isOpen={isVaultModalOpen}
@@ -433,6 +544,26 @@ export function DashboardShell() {
 
       {/* Real-time Notifications Drawer */}
       <NotificationDrawer />
+
+      {/* Toast Notification Pill */}
+      {toastNotification && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-6 right-6 z-50 px-4 py-2.5 rounded-xl shadow-xl border text-xs font-semibold flex items-center gap-2 animate-in fade-in slide-in-from-bottom-2 duration-200 ${
+            toastNotification.type === "success"
+              ? "bg-black text-white border-black/20"
+              : "bg-red-600 text-white border-red-700"
+          }`}
+        >
+          {toastNotification.type === "success" ? (
+            <Check size={14} className="text-emerald-400" />
+          ) : (
+            <X size={14} className="text-white" />
+          )}
+          <span>{toastNotification.message}</span>
+        </div>
+      )}
     </div>
   );
 }

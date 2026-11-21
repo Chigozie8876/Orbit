@@ -33,6 +33,8 @@ export interface OrbitCheckoutProps {
   customClasses?: OrbitCustomClasses;
   allowedOrigins?: string[];
   customFields?: OrbitCustomField[];
+  captureEmail?: boolean;
+  onSuccess?: (event: OrbitSubscribedEvent & { email?: string }) => void;
 }
 
 export default function OrbitCheckout(props: OrbitCheckoutProps): JSX.Element;
