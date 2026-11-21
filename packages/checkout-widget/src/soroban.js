@@ -144,7 +144,9 @@ export const buildAtomicPlanTransaction = ({
 };
 
 /**
- * Submits a transaction through the backend gas relayer for fee sponsorship (#169).
+ * Submits a transaction through the backend gas relayer for fee sponsorship (#169, #297).
+ * The relayer only sponsors vault-creation transactions that pass its policy; anything it
+ * refuses falls back to direct submission, paid by the subscriber.
  */
 export async function submitSponsoredTransaction({
   server,
@@ -154,11 +156,11 @@ export async function submitSponsoredTransaction({
 }) {
   if (apiUrl) {
     try {
-      const res = await fetch(`${apiUrl}/relay/sponsor-transaction`, {
+      const res = await fetch(`${apiUrl}/api/relayer/sponsor`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tx_xdr: transaction.toXDR(),
+          signed_tx_xdr: transaction.toXDR(),
           network_passphrase: networkPassphrase,
         }),
       });

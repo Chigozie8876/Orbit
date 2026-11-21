@@ -82,6 +82,7 @@ const { registerPrivacyRoutes } = require('./privacy');
 const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
 const { registerCohortRoutes } = require('./cohorts');
 const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerBalanceReminderRoutes } = require('./balance-reminders');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute } = require('./rpc-proxy');
@@ -248,6 +249,18 @@ const relayRateLimit = createRateLimiter({
     message: "Relay rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters.relay = relayRateLimit;
+
+// Sponsorship requests come from unauthenticated checkout sessions, so they are
+// throttled per client IP rather than per merchant (#297)
+const sponsorRateLimit = createRateLimiter({
+    name: 'relay-sponsor',
+    store: rateLimitStore,
+    windowMs: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+    limit: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_MAX) || 5,
+    keyGenerator: (req) => getClientIp(req) || 'unknown',
+    message: "Sponsorship rate limit exceeded, please retry later",
+});
+app.locals.rateLimiters.relaySponsor = sponsorRateLimit;
 
 // How long to keep polling getTransaction() for a submitted hash before giving up
 const TX_POLL_TIMEOUT_MS = Number(process.env.TX_POLL_TIMEOUT_MS) || 30000;
@@ -1152,26 +1165,74 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
 });
 
 /**
- * POST /relay/sponsor-transaction (#169)
- * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ * POST /api/relayer/sponsor (#297)
+ * Wraps a subscriber-signed vault-creation transaction in a fee bump paid by the Orbit
+ * relayer, so a subscriber holding USDC but no XLM can onboard. The transaction must pass
+ * the sponsorship policy (sponsorship.js) and the relayer's fee caps before anything is
+ * signed or spent. Body: { signed_tx_xdr } (`tx_xdr` is accepted for the #169 widget).
+ *
+ * POST /relay/sponsor-transaction is kept as an alias for existing widgets. It used to
+ * fee-bump any transaction it was given; it now enforces the same policy.
  */
-app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
-    try {
-        const { tx_xdr, network_passphrase } = req.body || {};
-        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
-        const relayer = getRelayer();
-        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+const sponsorSchema = z.object({
+    signed_tx_xdr: z.string().min(1).optional(),
+    tx_xdr: z.string().min(1).optional(),
+    network_passphrase: z.string().optional(),
+}).refine((body) => body.signed_tx_xdr || body.tx_xdr, { message: 'signed_tx_xdr is required' });
 
-        const result = await relayer.sponsorTransaction({
-            txXdr: tx_xdr,
-            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
-        });
-        return res.status(200).json(result);
-    } catch (err) {
-        console.error('Error sponsoring transaction:', err);
-        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
+const findMerchantByWallet = async (walletAddress) => {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from('merchants')
+        .select('id')
+        .eq('wallet_address', walletAddress)
+        .maybeSingle();
+    if (error) throw error;
+    return data ?? null;
+};
+
+const SPONSOR_STATUS = { SUCCESS: 200, FAILED: 422, NOT_FOUND: 202 };
+
+const handleSponsorRequest = async (req, res) => {
+    const parsed = sponsorSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return res.status(400).json({ error: formatZodError(parsed.error), code: 'invalid_request' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+    const expectedPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+    if (parsed.data.network_passphrase && parsed.data.network_passphrase !== expectedPassphrase) {
+        return res.status(400).json({ error: 'This relayer only sponsors transactions on its own network', code: 'wrong_network' });
     }
-});
+
+    try {
+        const outcome = await relayer.sponsorUserTransaction({
+            txXdr: parsed.data.signed_tx_xdr || parsed.data.tx_xdr,
+            resolveMerchant: findMerchantByWallet,
+            confirm: (server, hash) => waitForTransaction(server, hash, {
+                timeoutMs: app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS,
+                intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
+            }),
+        });
+        const status = outcome.status === 'NOT_FOUND' ? 'PENDING' : outcome.status;
+        return res.status(SPONSOR_STATUS[outcome.status] ?? 502).json({
+            status,
+            tx_hash: outcome.txHash,
+            sponsored: true,
+            sponsor_address: relayer.sponsorAddress,
+            fee_charged_stroops: outcome.feeCharged,
+            max_fee_stroops: outcome.maxFee,
+            ...(outcome.status === 'FAILED' ? { error: 'The sponsored transaction failed on-chain', code: 'transaction_failed' } : {}),
+        });
+    } catch (err) {
+        if (isRelayerError(err)) return sendResult(res, relayerErrorResult(err));
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: 'Fee sponsorship failed', code: 'sponsorship_error' });
+    }
+};
+
+app.post('/api/relayer/sponsor', sponsorRateLimit, handleSponsorRequest);
+app.post('/relay/sponsor-transaction', sponsorRateLimit, handleSponsorRequest);
 
 // ==========================================
 // ROUTE 5: POST /subscriptions (Create Subscription after Handshake)
@@ -2122,6 +2183,7 @@ registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
 registerCohortRoutes(app, getSupabase, authenticateMerchant);
 registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerBalanceReminderRoutes(app, { getSupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
