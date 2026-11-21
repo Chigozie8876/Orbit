@@ -6,15 +6,29 @@ const { z } = require('zod');
 const { StrKey, Keypair, rpc, Networks, TransactionBuilder, Contract, Address } = require('@stellar/stellar-sdk');
 const { executeIdempotently, withBillingLock, sendResult } = require('./idempotency');
 const { API_KEY_ENVIRONMENTS, issueApiKey, requireApiKey } = require('./apiKeys');
-const { createRateLimiter } = require('./rateLimit');
+const {
+    createRateLimiter,
+    createStoreFromEnv,
+    apiKeyTierLimit,
+    apiKeyTierLimitsFromEnv,
+    resolveApiKeyTier,
+} = require('./rateLimit');
+const { createReputationScorer, createHorizonWalletLookup } = require('./reputation');
+const { isRelayerError, createRelayerFromEnv } = require('./relayer');
+const { createFeeEstimator } = require('./fee-estimator');
 const { getAuditLogsQuerySchema, getClientIp, getActorAddress, writeAuditLog } = require('./audit');
 const {
     createWebhookSchema,
     updateWebhookSchema,
+    backfillWebhookSchema,
     generateSigningSecret,
     dispatchWebhookEvent,
     resendWebhookDelivery,
+    replayWebhookEvents,
+    replayDeadLetter,
+    setDeliveryObserver,
 } = require('./webhooks');
+const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -24,49 +38,198 @@ const {
     processDunningRetries,
 } = require('./dunning');
 const { registerComplianceRoutes } = require('./compliance');
+const { registerDunningWorkflowRoutes, loadDunningWorkflow } = require('./dunning-workflow');
 const { registerSigningSessionRoutes } = require('./signing-sessions');
+const { registerTransactionExportRoute, confirmedSettlementAmount } = require('./transaction-report');
+const { registerCustomerPortalRoutes } = require('./customer-portal');
 const { registerFailureRecoveryRoutes } = require('./failure-recovery');
+const { registerAnalyticsRoutes } = require('./analytics');
+const { registerCouponRoutes, normalizeCode } = require('./coupons');
+const { registerGraphql } = require('./graphql');
+const { createSubscriptionEventBus } = require('./subscription-stream');
+const { registerHandoverRoutes } = require('./handover-sessions');
+const { configuredIndexer, registerIndexerRoutes } = require('./ledger-indexer');
+const { recordPullFailure, registerBillingResolutionRoutes } = require('./billing-resolution');
+const {
+    isFiatCurrency,
+    getRate,
+    calculateUsdcUnits,
+    quoteUsdcAmount,
+    getSupportedRates,
+    startOracleWorker,
+    SlippageError,
+    RateUnavailableError,
+} = require('./oracle');
+const {
+    createPayoutSplitDispatcher,
+    createStellarSplitForwarder,
+    registerPayoutSplitRoutes,
+} = require('./payout-splits');
+const {
+    createPriceIndexationWorker,
+    registerPriceIndexationRoutes,
+} = require('./price-indexation');
+const {
+    createSnapshotExportWorker,
+    registerSnapshotRoutes,
+} = require('./contract-state-snapshot');
+const { getDatabaseManager } = require('./db');
+const { registerPrivacyRoutes } = require('./privacy');
+const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
+const { registerCohortRoutes } = require('./cohorts');
+const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerProofRoutes } = require('./proofs');
+const { registerOrganizationRoutes } = require('./organizations');
+const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
+const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
+const { registerCredentialRoutes } = require('./credentials');
+const { registerPaymentLinkRoutes } = require('./payment-links');
+const { checkSchemaOnStartup } = require('./migrate');
+const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
+const { registerDevFundingRoutes } = require('./dev-faucet');
+const {
+    createRemoteMerchantSigner,
+    createSupabaseStore: createRecurringPullStore,
+    createRecurringPullWorker,
+    startRecurringPullWorker,
+} = require('./recurring-pulls');
 
 const app = express();
+const feeEstimator = createFeeEstimator({ horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org' });
+let defaultUsageBuffer;
+const getUsageBuffer = () => app.locals.usageBuffer || (defaultUsageBuffer ??= createUsageBufferFromEnv());
 // Set when running behind a reverse proxy so req.ip (used for rate limiting) is the client's address
 if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
 app.use(cors());
 
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
-// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
-// (including floods of invalid API keys) cannot exhaust the database
-const ipRateLimit = createRateLimiter({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.IP_RATE_LIMIT_MAX) || 300,
-    keyGenerator: (req) => req.ip,
+// Shared by every limiter and the reputation scorer: Redis (with an in-memory
+// fallback) when REDIS_URL is set, so limits hold across all API instances
+const rateLimitStore = createStoreFromEnv();
+// Wallet age is scored only when Horizon is configured; tests inject app.locals.walletLookup
+const horizonWalletLookup = process.env.HORIZON_URL
+    ? createHorizonWalletLookup({ horizonUrl: process.env.HORIZON_URL })
+    : null;
+const reputation = createReputationScorer({
+    store: rateLimitStore,
+    walletLookup: async (address) => {
+        const lookup = app.locals.walletLookup || horizonWalletLookup;
+        return lookup ? lookup(address) : null;
+    },
+    ipTrustAfterMs: Number(process.env.REPUTATION_IP_TRUST_AFTER_MS) || undefined,
 });
-// Per-API-key limit on authenticated merchant routes
-const apiKeyRateLimit = createRateLimiter({
+// Coarse per-IP limit on every route, public or not, so unauthenticated traffic
+// (including floods of invalid API keys) cannot exhaust the database. Scaled by the
+// IP's reputation: new IPs and repeat offenders get less, merchant IPs more.
+const ipRateLimit = createRateLimiter({
+    name: 'ip',
+    store: rateLimitStore,
     windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: Number(process.env.API_KEY_RATE_LIMIT_MAX) || 100,
+    limit: reputation.ipLimit(Number(process.env.IP_RATE_LIMIT_MAX) || 300),
+    keyGenerator: (req) => req.ip,
+    onLimitReached: (req) => reputation.recordViolation(req.ip),
+});
+// Per-API-key limit on authenticated merchant routes (#231). The key's tier quota
+// (free: 60, pro: 600 requests per window by default) is the base allowance, which
+// reputation scoring then scales by key environment and wallet age as before.
+const apiKeyTierLimits = apiKeyTierLimitsFromEnv();
+const apiKeyTierQuota = apiKeyTierLimit(apiKeyTierLimits);
+const apiKeyRateLimit = createRateLimiter({
+    name: 'key',
+    store: rateLimitStore,
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: (req) => reputation.apiKeyLimit(apiKeyTierQuota(req))(req),
     keyGenerator: (req) => req.apiKey?.id,
     message: "API key rate limit exceeded, please retry later",
+    describe: (req) => ({ tier: resolveApiKeyTier(req, apiKeyTierLimits) }),
 });
 app.locals.rateLimiters = { ip: ipRateLimit, apiKey: apiKeyRateLimit };
+app.locals.reputation = reputation;
 
 app.use(ipRateLimit);
-app.use(express.json());
+// Keeps the raw bytes of Stripe webhooks, which are signed over the exact body (#131)
+app.use(express.json({ verify: captureStripeRawBody }));
 
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Using service role for backend logic
-let defaultSupabase = null;
-if (supabaseUrl && supabaseKey) {
-    defaultSupabase = createClient(supabaseUrl, supabaseKey);
-}
-
-const getSupabase = () => app.locals.supabase || defaultSupabase;
+// Multi-region database manager with read-replica failover (#139)
+const dbManager = getDatabaseManager();
+const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(appInstance);
+const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
+const getSupabase = () => getPrimarySupabase(app);
 
 // Merchant routes: authenticate the API key, then apply its rate limit
-const authenticateMerchant = [requireApiKey(getSupabase), apiKeyRateLimit];
+const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
+registerAnalyticsRoutes(app, getSupabase);
+registerPaymentLinkRoutes(app, getSupabase, authenticateMerchant);
+// Testnet Friendbot + USDC trustline bootstrap for local development (#232);
+// not registered at all when NODE_ENV=production
+registerDevFundingRoutes(app, {
+    getFetch: () => app.locals.fetchImpl,
+    getHorizonServer: () => app.locals.devHorizonServer,
+});
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
 const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
+
+// One relayer per process: its sequence cache and channel pool must be shared by all requests.
+// Tests inject their own through app.locals.relayer.
+let defaultRelayer;
+const getRelayer = () => {
+    if (app.locals.relayer) return app.locals.relayer;
+    if (defaultRelayer === undefined) {
+        defaultRelayer = createRelayerFromEnv({
+            server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+            getSupabase,
+            feeEstimator,
+        });
+    }
+    return defaultRelayer;
+};
+
+// Forward transfers for merchant payout splits (#160). The merchant treasury (or a
+// dedicated split relayer) signs and pays; when no key is configured, splits are
+// still recorded as pending so an operator can reconcile them later.
+let defaultSplitForwarder;
+const getSplitForwarder = () => {
+    if (app.locals.splitForwarder !== undefined) return app.locals.splitForwarder;
+    if (defaultSplitForwarder === undefined) {
+        const secret = process.env.SPLIT_RELAYER_SECRET_KEY || process.env.RELAYER_SECRET_KEY;
+        const tokenContractId = process.env.SPLIT_TOKEN_CONTRACT_ID || process.env.USDC_CONTRACT_ID;
+        if (!secret || !tokenContractId) {
+            defaultSplitForwarder = null;
+        } else {
+            defaultSplitForwarder = createStellarSplitForwarder({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                sourceKeypair: Keypair.fromSecret(secret),
+                tokenContractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            });
+        }
+    }
+    return defaultSplitForwarder;
+};
+
+const getPayoutSplitDispatcher = () => createPayoutSplitDispatcher({
+    supabase: getSupabase(),
+    forwarder: getSplitForwarder(),
+    getTreasuryWallet: async (merchantId) => {
+        const supabase = getSupabase();
+        if (!supabase) return null;
+        const { data } = await supabase.from('merchants').select('wallet_address').eq('id', merchantId).maybeSingle();
+        return data?.wallet_address ?? null;
+    },
+});
+
+// Per-merchant throttle on relay requests, on top of the general API key limit
+const relayRateLimit = createRateLimiter({
+    name: 'relay',
+    store: rateLimitStore,
+    windowMs: Number(process.env.RELAYER_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+    limit: Number(process.env.RELAYER_RATE_LIMIT_MAX) || 10,
+    keyGenerator: (req) => req.merchant?.id,
+    message: "Relay rate limit exceeded, please retry later",
+});
+app.locals.rateLimiters.relay = relayRateLimit;
 
 // How long to keep polling getTransaction() for a submitted hash before giving up
 const TX_POLL_TIMEOUT_MS = Number(process.env.TX_POLL_TIMEOUT_MS) || 30000;
@@ -76,6 +239,9 @@ const TX_POLL_INTERVAL_MS = Number(process.env.TX_POLL_INTERVAL_MS) || 1000;
 const PREPARE_LOCK_TTL_SECONDS = Number(process.env.PREPARE_LOCK_TTL_SECONDS) || 60;
 // Billing lease for submitting a pull must outlive confirmation polling
 const submitLockTtlSeconds = (pollTimeoutMs) => Math.ceil(pollTimeoutMs / 1000) + 60;
+// A relayed pull may also wait for a free channel and retry submission before polling
+const relayLockTtlSeconds = (pollTimeoutMs) =>
+    submitLockTtlSeconds(pollTimeoutMs) + Math.ceil((Number(process.env.RELAYER_QUEUE_TIMEOUT_MS) || 30000) / 1000) + 30;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -104,15 +270,41 @@ const stellarAddressSchema = z.string().refine(
 // merchant_id is taken from the API key; a client-supplied value is only checked against it
 const optionalMerchantIdSchema = z.string().uuid("merchant_id must be a valid UUID").optional();
 
-const createPlanSchema = z.object({
+// USDC plans store raw token units (USDC has 7 decimals, so 290000000 = 29
+// USDC), same as the contract's amount_per_interval. Fiat plans (USD/EUR) store
+// a price_amount in that currency, which the exchange rate oracle converts to
+// raw USDC units at the moment of pull (#96).
+const usdcPlanSchema = z.object({
     merchant_id: optionalMerchantIdSchema,
     name: z.string().trim().min(1, "name cannot be empty"),
-    // Raw token units (USDC has 7 decimals, so 290000000 = 29 USDC), same as the contract's amount_per_interval
     usdc_amount: z.coerce.number()
         .int("usdc_amount must be an integer in raw token units")
         .positive("usdc_amount must be greater than 0"),
     interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USDC']).default('USDC'),
 });
+
+const fiatPlanSchema = z.object({
+    merchant_id: optionalMerchantIdSchema,
+    name: z.string().trim().min(1, "name cannot be empty"),
+    price_amount: z.coerce.number()
+        .positive("price_amount must be greater than 0"),
+    interval_seconds: z.coerce.number().int().positive("interval_seconds must be a positive integer"),
+    currency: z.enum(['USD', 'EUR']),
+});
+
+// Validates the body against the schema for its pricing currency, so a USDC
+// plan still requires usdc_amount and a fiat plan still requires price_amount.
+const parseCreatePlanBody = (body) => {
+    const currencyResult = z
+        .object({ currency: z.enum(['USDC', 'USD', 'EUR']) })
+        .safeParse({ currency: body?.currency ?? 'USDC' });
+    if (!currencyResult.success) return currencyResult;
+
+    return currencyResult.data.currency === 'USDC'
+        ? usdcPlanSchema.safeParse(body)
+        : fiatPlanSchema.safeParse(body);
+};
 
 const getPlanParamsSchema = z.object({
     id: z.string().uuid("id parameter must be a valid UUID"),
@@ -126,6 +318,7 @@ const createSubscriptionSchema = z.object({
     plan_id: z.string().uuid("plan_id must be a valid UUID"),
     customer_wallet_address: stellarAddressSchema,
     metadata: z.record(z.any()).optional().default({}),
+    coupon_code: z.string().trim().min(3).max(32).regex(/^[A-Za-z0-9_-]+$/).optional(),
 });
 
 const triggerPullSchema = z.object({
@@ -135,6 +328,11 @@ const triggerPullSchema = z.object({
 const submitPullSchema = z.object({
     subscription_id: z.string().uuid("subscription_id must be a valid UUID"),
     signed_xdr: z.string().min(1, "signed_xdr is required"),
+}).strict();
+
+const relaySubmitPullSchema = z.object({
+    subscription_id: z.string().uuid("subscription_id must be a valid UUID"),
+    signed_auth_entry_xdr: z.string().min(1, "signed_auth_entry_xdr is required"),
 }).strict();
 
 const createApiKeySchema = z.object({
@@ -171,16 +369,19 @@ const MERCHANT_MISMATCH_ERROR = { error: "merchant_id does not match the authent
 // ROUTE 1: POST /plans (Create a new pricing plan)
 // ==========================================
 app.post('/plans', authenticateMerchant, async (req, res) => {
-    const parseResult = createPlanSchema.safeParse(req.body);
+    const parseResult = parseCreatePlanBody(req.body);
     if (!parseResult.success) {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
     if (merchantMismatch(req, parseResult.data.merchant_id)) return res.status(403).json(MERCHANT_MISMATCH_ERROR);
 
-    const { name, usdc_amount, interval_seconds } = parseResult.data;
+    const { name, currency, interval_seconds } = parseResult.data;
     const merchant_id = req.merchant.id;
-    const supabase = getSupabase();
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -188,9 +389,30 @@ app.post('/plans', authenticateMerchant, async (req, res) => {
         label: "creating plan",
         resolveMerchant: () => ({ merchantId: merchant_id }),
     }, async () => {
+        // Fiat plans: cache the current USDC equivalent for dashboards. The
+        // authoritative amount is always recalculated at the moment of pull;
+        // when the cache is cold the placeholder stays 0 until the oracle
+        // worker publishes the first rate.
+        let usdc_amount = parseResult.data.usdc_amount;
+        const price_amount = parseResult.data.price_amount;
+        if (isFiatCurrency(currency)) {
+            usdc_amount = 0;
+            try {
+                const rateInfo = await getRate({
+                    supabase,
+                    fetchImpl: app.locals.fetchImpl,
+                    currency,
+                    allowNetwork: false,
+                });
+                if (rateInfo) usdc_amount = calculateUsdcUnits({ amount: price_amount, rate: rateInfo.rate });
+            } catch (err) {
+                console.error("Error deriving plan usdc_amount from oracle cache:", err.message);
+            }
+        }
+
         const { data, error } = await supabase
             .from('plans')
-            .insert([{ merchant_id, name, usdc_amount, interval_seconds }])
+            .insert([{ merchant_id, name, currency, usdc_amount, price_amount, interval_seconds }])
             .select()
             .single();
 
@@ -224,8 +446,8 @@ app.get('/plans/:id', async (req, res) => {
 
     try {
         const { id } = parseResult.data;
-        const supabase = getSupabase();
-        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
 
         const { data, error } = await supabase
             .from('plans')
@@ -278,6 +500,24 @@ app.get('/subscribers', authenticateMerchant, async (req, res) => {
 });
 
 // ==========================================
+// ROUTE: GET /rates (Exchange rate oracle)
+// ==========================================
+// Returns the supported fiat->USDC conversion pairs with their newest cached
+// rate, refreshed from the live feed on a cold cache (#96).
+app.get('/rates', async (req, res) => {
+    try {
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+
+        const rates = await getSupportedRates({ supabase, fetchImpl: app.locals.fetchImpl });
+        res.status(200).json(rates);
+    } catch (err) {
+        console.error("Error fetching exchange rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
 // Loads a subscription owned by the authenticated merchant. Another merchant's
@@ -287,7 +527,7 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
         .from('subscriptions')
         .select(`
             *,
-            plans ( merchant_id, usdc_amount, interval_seconds )
+            plans ( merchant_id, usdc_amount, interval_seconds, currency, price_amount )
         `)
         .eq('id', subscriptionId)
         .single();
@@ -295,8 +535,210 @@ const loadPullContext = async (supabase, subscriptionId, merchant) => {
     if (isNoRowsError(subError) || !sub) return { status: 404, error: "Subscription not found" };
     if (subError) throw subError;
     if (sub.plans?.merchant_id !== merchant.id) return { status: 404, error: "Subscription not found" };
+    // A coupon quote must not silently charge the fixed-price legacy Soroban vault.
+    if (sub.coupon_id && !sub.promotion_onchain_verified) {
+        return { status: 409, error: "Promotional vault terms are not verified on-chain; billing is blocked" };
+    }
 
     return { sub, merchant };
+};
+
+// Records the confirmed outcome of a pull transaction, whoever submitted it
+const applyPullOutcome = async ({
+    supabase,
+    req,
+    sub,
+    merchant,
+    subscription_id,
+    txHash,
+    status,
+    confirmation = null,
+    server = null,
+    signedTx = null,
+    extraBody = {},
+    subscriptionAlreadySettled = false,
+    settledAt = null,
+    nextBillingDate = null,
+    // Seconds spent waiting for Soroban confirmation, for orbit_pull_duration_seconds (#230)
+    confirmationSeconds = null,
+}) => {
+    recordPullOutcome(status, confirmationSeconds);
+    if (status === "SUCCESS") {
+        const pullTime = settledAt || new Date();
+        const nextBilling = nextBillingDate
+            ? new Date(nextBillingDate)
+            : new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
+
+        if (!subscriptionAlreadySettled) {
+            const { error: subscriptionUpdateError } = await supabase
+                .from('subscriptions')
+                .update({
+                    next_billing_date: nextBilling.toISOString(),
+                    status: 'active',
+                    retry_count: 0,
+                    dunning_status: null,
+                    next_dunning_retry_at: null,
+                    last_failure: null,
+                })
+                .eq('id', subscription_id);
+            if (subscriptionUpdateError) throw subscriptionUpdateError;
+        }
+
+        await writeAuditLog(supabase, {
+            merchantId: sub.plans.merchant_id,
+            actorAddress: getActorAddress(req, merchant.wallet_address),
+            action: 'pull.execute',
+            resourceType: 'subscription',
+            resourceId: subscription_id,
+            ipAddress: getClientIp(req),
+            changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
+            changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash },
+        });
+
+        if (sub.plans.merchant_id) {
+            // Fiat plans report the settled amount in raw USDC units
+            // converted at the current cached rate (#96)
+            let settledAmount = sub.plans.usdc_amount;
+            if (isFiatCurrency(sub.plans?.currency)) {
+                try {
+                    const quote = await quoteUsdcAmount({
+                        supabase,
+                        plan: sub.plans,
+                        subscription: sub,
+                        fetchImpl: app.locals.fetchImpl,
+                        allowNetwork: false,
+                        enforceSlippage: false,
+                    });
+                    settledAmount = quote.usdc_amount;
+                } catch {
+                    // Keep the stored plan amount when the cache cannot price it
+                }
+            }
+
+            // Only emit settlement events for independently verified on-chain transfers.
+            const verifiedAmount = confirmedSettlementAmount(confirmation, {
+                customerWallet: sub.customer_wallet_address,
+                merchantWallet: merchant.wallet_address,
+                contractId: process.env.ORBIT_CONTRACT_ID,
+            });
+            if (verifiedAmount === null) {
+                console.error('CRITICAL: confirmed transfer missing verified amount; reconcile transaction:', txHash);
+            } else {
+                const paymentRecord = {
+                    merchant_id: sub.plans.merchant_id,
+                    subscription_id,
+                    plan_id: sub.plan_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount_usdc_units: verifiedAmount,
+                    status: 'settled',
+                    tx_hash: txHash,
+                    settled_at: pullTime.toISOString(),
+                };
+                const { data: payment, error: paymentError } = await supabase
+                    .from('payment_transactions').insert([paymentRecord]).select().single();
+                if (paymentError && paymentError.code !== '23505') {
+                    console.error('CRITICAL: on-chain settlement needs ledger reconciliation:', txHash, paymentError);
+                } else {
+                    // Publication happens only after a confirmed transfer is recorded,
+                    // and is safe for consumers to deduplicate by transaction hash.
+                    app.locals.paymentEventBus?.publish('paymentSettled', {
+                        id: txHash, merchantId: sub.plans.merchant_id,
+                        subscriptionId: subscription_id,
+                        amount: String(verifiedAmount),
+                        txHash, status: 'settled', settledAt: pullTime.toISOString(),
+                    }).catch((error) => console.error('Settlement stream publish failed:', error));
+                }
+                if (payment) {
+                    try {
+                        const invoiceService = app.locals.invoiceService || createInvoiceService({ supabase });
+                        await invoiceService.createForSettledPayment({
+                            payment, merchant, plan: sub.plans, subscription: sub,
+                            ledgerSequence: confirmation?.ledger ?? confirmation?.ledgerSequence ?? null,
+                        });
+                    } catch (invoiceError) {
+                        console.error('Invoice generation failed:', invoiceError);
+                    }
+                }
+            }
+
+            await dispatchWebhookEvent(supabase, {
+                merchantId: sub.plans.merchant_id,
+                eventType: 'payment.settled',
+                payload: {
+                    event: 'payment.settled',
+                    subscription_id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    amount: settledAmount,
+                    txHash,
+                    settled_at: pullTime.toISOString(),
+                },
+                fetchImpl: app.locals.fetchImpl,
+            });
+
+            // Automated revenue sharing (#160): forward each configured split
+            // share from the merchant treasury, recording the primary pull hash
+            // next to every secondary split transfer hash. Failures here never
+            // fail the settlement itself.
+            try {
+                await getPayoutSplitDispatcher().handlePaymentSettled({
+                    merchantId: sub.plans.merchant_id,
+                    subscriptionId: subscription_id,
+                    primaryTxHash: txHash,
+                    amountUnits: sub.plans.usdc_amount,
+                    settledAt: pullTime.toISOString(),
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (splitErr) {
+                console.error("Payout split dispatch failed:", splitErr);
+            }
+        }
+
+        return {
+            status: 200,
+            body: { message: "Successfully pulled funds on-chain!", txHash, ...extraBody },
+        };
+    }
+
+    if (status === "FAILED") {
+        await recordPullFailure(supabase, subscription_id, 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.', txHash);
+        if (server && signedTx) {
+            let failureReason = 'Transaction failed on-chain; inspect transaction diagnostics for the specific contract error.';
+            try {
+                const simulation = await server.simulateTransaction(signedTx);
+                if (simulation?.error) failureReason = simulation.error;
+            } catch {
+                // Keep the original failure when RPC diagnostics are unavailable
+            }
+            await recordPullFailure(supabase, subscription_id, failureReason, txHash);
+        }
+        await markSubscriptionPastDue(supabase, subscription_id, {
+            actorAddress: merchant.wallet_address,
+            ipAddress: getClientIp(req),
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        return {
+            status: 502,
+            body: { error: "Transaction failed on-chain", txHash, ...extraBody },
+        };
+    }
+
+    // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
+    // Keep the lease until it expires so no second pull races the one still in flight.
+    await recordPullFailure(supabase, subscription_id, 'RPC timeout: transaction submitted but not yet confirmed. Do not retry until its outcome is known.', txHash);
+    if (server && signedTx) {
+        await recordPullFailure(
+            supabase,
+            subscription_id,
+            'Transaction submitted, but Soroban RPC confirmation timed out (NOT_FOUND)',
+            txHash,
+        );
+    }
+    return {
+        status: 202,
+        body: { message: "Transaction submitted but not yet confirmed; check back later", txHash, ...extraBody },
+        holdLock: true,
+    };
 };
 
 app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
@@ -305,6 +747,7 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id } = parseResult.data;
         const supabase = getSupabase();
@@ -313,67 +756,111 @@ app.post('/trigger-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const result = await executeIdempotently({
             supabase,
             req,
             label: "preparing pull",
             resolveMerchant: () => ({ merchantId: sub.plans.merchant_id }),
-        }, () => withBillingLock({
-            supabase,
-            subscriptionId: subscription_id,
-            ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
         }, async () => {
-            const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
-            if (!ORBIT_CONTRACT_ID) {
-                return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+            // Price the pull (#96): fiat plans convert price_amount into raw
+            // USDC units at the live rate and are rejected when the rate moved
+            // more than the slippage tolerance away from the quoted rate.
+            let pricing;
+            try {
+                pricing = await quoteUsdcAmount({
+                    supabase,
+                    plan: sub.plans,
+                    subscription: sub,
+                    fetchImpl: app.locals.fetchImpl,
+                });
+            } catch (err) {
+                if (err instanceof SlippageError) {
+                    return { status: 409, body: { error: err.message, ...err.details } };
+                }
+                if (err instanceof RateUnavailableError) {
+                    return { status: 503, body: { error: err.message } };
+                }
+                throw err;
             }
 
-            const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
-            const server = getSorobanServer(rpcUrl);
-            const contract = new Contract(ORBIT_CONTRACT_ID);
+            // A fiat subscription created while the rate cache was cold has no
+            // quote yet: store this pull's rate so the next one is guarded.
+            if (
+                isFiatCurrency(sub.plans?.currency) &&
+                pricing.rate != null &&
+                (sub.quoted_rate === null || sub.quoted_rate === undefined)
+            ) {
+                const { error: quoteError } = await supabase
+                    .from('subscriptions')
+                    .update({ quoted_rate: pricing.rate })
+                    .eq('id', subscription_id);
+                if (quoteError) console.error("Failed to persist subscription quote:", quoteError.message);
+            }
 
-            // 3. Build the Soroban Transaction
-            const account = await server.getAccount(merchant.wallet_address);
+            return withBillingLock({
+                supabase,
+                subscriptionId: subscription_id,
+                ttlSeconds: PREPARE_LOCK_TTL_SECONDS,
+            }, async () => {
+                const ORBIT_CONTRACT_ID = process.env.ORBIT_CONTRACT_ID;
+                if (!ORBIT_CONTRACT_ID) {
+                    return { status: 500, body: { error: "ORBIT_CONTRACT_ID not set in .env" } };
+                }
 
-            const tx = new TransactionBuilder(account, {
-                fee: "1000000",
-                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
-            })
-            .addOperation(contract.call("pull_funds",
-                Address.fromString(sub.customer_wallet_address).toScVal(),
-                Address.fromString(merchant.wallet_address).toScVal()
-            ))
-            .setTimeout(30)
-            .build();
+                const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+                const server = getSorobanServer(rpcUrl);
+                const contract = new Contract(ORBIT_CONTRACT_ID);
 
-            // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
-            const preparedTx = await server.prepareTransaction(tx);
+                // 3. Build the Soroban Transaction
+                const account = await server.getAccount(merchant.wallet_address);
 
-            await writeAuditLog(supabase, {
-                merchantId: sub.plans.merchant_id,
-                actorAddress: getActorAddress(req, merchant.wallet_address),
-                action: 'pull.prepare',
-                resourceType: 'subscription',
-                resourceId: subscription_id,
-                ipAddress: getClientIp(req),
-                changesBefore: null,
-                changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                const tx = new TransactionBuilder(account, {
+                    fee: String(await feeEstimator.estimate({ priority: "standard" })),
+                    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
+                })
+                .addOperation(contract.call("pull_funds",
+                    Address.fromString(sub.customer_wallet_address).toScVal(),
+                    Address.fromString(merchant.wallet_address).toScVal()
+                ))
+                .setTimeout(30)
+                .build();
+
+                // Simulate and return an unsigned envelope. The merchant signs it in their wallet.
+                const preparedTx = await server.prepareTransaction(tx);
+
+                await writeAuditLog(supabase, {
+                    merchantId: sub.plans.merchant_id,
+                    actorAddress: getActorAddress(req, merchant.wallet_address),
+                    action: 'pull.prepare',
+                    resourceType: 'subscription',
+                    resourceId: subscription_id,
+                    ipAddress: getClientIp(req),
+                    changesBefore: null,
+                    changesAfter: { subscription_id, merchant_address: merchant.wallet_address },
+                });
+
+                return {
+                    status: 200,
+                    body: {
+                        transaction_xdr: preparedTx.toXDR(),
+                        network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                        merchant_address: merchant.wallet_address,
+                        subscription_id,
+                        // Amount to settle this cycle (raw USDC units)
+                        usdc_amount: pricing.usdc_amount,
+                        currency: pricing.currency,
+                        rate: pricing.rate,
+                    },
+                };
             });
-
-            return {
-                status: 200,
-                body: {
-                    transaction_xdr: preparedTx.toXDR(),
-                    network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
-                    merchant_address: merchant.wallet_address,
-                    subscription_id,
-                },
-            };
-        }));
+        });
+        if (result.status >= 500) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull preparation failed');
         sendResult(res, result);
     } catch (err) {
         console.error("Error preparing pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
         res.status(500).json({ error: err.message });
     }
 });
@@ -383,6 +870,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
     const parseResult = submitPullSchema.safeParse(req.body);
     if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
 
+    let ownedSubscriptionId;
     try {
         const { subscription_id, signed_xdr } = parseResult.data;
         const supabase = getSupabase();
@@ -390,6 +878,7 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
+        ownedSubscriptionId = subscription_id;
 
         const pollTimeoutMs = app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS;
 
@@ -445,85 +934,206 @@ app.post('/submit-pull', authenticateMerchant, async (req, res) => {
                 const txHash = submitResponse.hash;
 
                 // 5. Confirm the transaction actually landed before touching billing state
+                const confirmStarted = process.hrtime.bigint();
                 const confirmation = await waitForTransaction(server, txHash, {
                     timeoutMs: pollTimeoutMs,
                     intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
                 });
 
-                if (confirmation.status === "SUCCESS") {
-                    const pullTime = new Date();
-                    const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
-
-                    await supabase
-                        .from('subscriptions')
-                        .update({
-                            next_billing_date: nextBilling.toISOString(),
-                            status: 'active',
-                            retry_count: 0,
-                            dunning_status: null,
-                            next_dunning_retry_at: null,
-                        })
-                        .eq('id', subscription_id);
-
-                    await writeAuditLog(supabase, {
-                        merchantId: sub.plans.merchant_id,
-                        actorAddress: getActorAddress(req, merchant.wallet_address),
-                        action: 'pull.execute',
-                        resourceType: 'subscription',
-                        resourceId: subscription_id,
-                        ipAddress: getClientIp(req),
-                        changesBefore: { next_billing_date: sub.next_billing_date, status: sub.status },
-                        changesAfter: { next_billing_date: nextBilling.toISOString(), status: 'active', txHash },
-                    });
-
-                    if (sub.plans.merchant_id) {
-                        await dispatchWebhookEvent(supabase, {
-                            merchantId: sub.plans.merchant_id,
-                            eventType: 'payment.settled',
-                            payload: {
-                                event: 'payment.settled',
-                                subscription_id,
-                                customer_wallet_address: sub.customer_wallet_address,
-                                amount: sub.plans.usdc_amount,
-                                txHash,
-                                settled_at: pullTime.toISOString(),
-                            },
-                            fetchImpl: app.locals.fetchImpl,
-                        });
-                    }
-
-                    return {
-                        status: 200,
-                        body: { message: "Successfully pulled funds on-chain!", txHash },
-                    };
-                }
-
-                if (confirmation.status === "FAILED") {
-                    await markSubscriptionPastDue(supabase, subscription_id, {
-                        actorAddress: merchant.wallet_address,
-                        ipAddress: getClientIp(req),
-                        fetchImpl: app.locals.fetchImpl,
-                    });
-
-                    return {
-                        status: 502,
-                        body: { error: "Transaction failed on-chain", txHash },
-                    };
-                }
-
-                // Still NOT_FOUND after the timeout: outcome unknown, let the caller poll later.
-                // Keep the lease until it expires so no second pull races the one still in flight.
-                return {
-                    status: 202,
-                    body: { message: "Transaction submitted but not yet confirmed; check back later", txHash },
-                    holdLock: true,
-                };
+                return applyPullOutcome({
+                    supabase,
+                    req,
+                    sub,
+                    merchant,
+                    subscription_id,
+                    txHash,
+                    status: confirmation.status,
+                    confirmation,
+                    server,
+                    signedTx,
+                    confirmationSeconds: Number(process.hrtime.bigint() - confirmStarted) / 1e9,
+                });
             });
         });
         sendResult(res, result);
     } catch (err) {
         console.error("Error submitting pull:", err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// ROUTE 4b: Sponsored pulls through the fee-bump relayer
+// ==========================================
+// The merchant signs only the Soroban authorization for pull_funds; the Orbit relayer
+// submits the transaction and pays its fees, so the merchant wallet needs no XLM for fees.
+
+const relayerErrorResult = (err) => ({
+    status: err.status,
+    body: { error: err.message, code: err.code },
+    headers: err.retryAfter ? { 'Retry-After': String(err.retryAfter) } : undefined,
+});
+
+const RELAYER_NOT_CONFIGURED = { error: "Gas sponsorship relayer is not configured", code: "relayer_unavailable" };
+
+app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
+    const parseResult = triggerPullSchema.safeParse(req.body);
+    if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
+
+    try {
+        const { subscription_id } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
+
+        let prepared;
+        try {
+            prepared = await relayer.preparePullAuthorization({
+                user: sub.customer_wallet_address,
+                merchant: merchant.wallet_address,
+            });
+        } catch (err) {
+            if (isRelayerError(err)) return sendResult(res, relayerErrorResult(err));
+            throw err;
+        }
+
+        res.status(200).json({
+            auth_entry_xdr: prepared.authEntryXdr,
+            valid_until_ledger: prepared.validUntilLedger,
+            network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            merchant_address: merchant.wallet_address,
+            sponsor_address: relayer.sponsorAddress,
+            subscription_id,
+        });
+    } catch (err) {
+        console.error("Error preparing sponsored pull:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
+    const parseResult = relaySubmitPullSchema.safeParse(req.body);
+    if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
+
+    try {
+        const { subscription_id, signed_auth_entry_xdr } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
+
+        const pollTimeoutMs = app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS;
+        const pullParties = { user: sub.customer_wallet_address, merchant: merchant.wallet_address };
+
+        const result = await executeIdempotently({
+            supabase,
+            req,
+            label: "relaying pull",
+            resolveMerchant: () => ({ merchantId: sub.plans.merchant_id }),
+        }, async () => {
+            let entry;
+            try {
+                entry = await relayer.verifyPullAuthorization({ entryXdr: signed_auth_entry_xdr, ...pullParties });
+            } catch (err) {
+                if (isRelayerError(err)) return relayerErrorResult(err);
+                throw err;
+            }
+
+            return withBillingLock({
+                supabase,
+                subscriptionId: subscription_id,
+                ttlSeconds: relayLockTtlSeconds(pollTimeoutMs),
+            }, async () => {
+                let outcome;
+                // A relayed pull may be fee-bumped and confirmed more than once; time all of it
+                let confirmationNs = 0n;
+                try {
+                    outcome = await relayer.relayPull({
+                        merchantId: merchant.id,
+                        entry,
+                        ...pullParties,
+                        confirm: async (server, hash) => {
+                            const started = process.hrtime.bigint();
+                            try {
+                                return await waitForTransaction(server, hash, {
+                                    timeoutMs: pollTimeoutMs,
+                                    intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
+                                });
+                            } finally {
+                                confirmationNs += process.hrtime.bigint() - started;
+                            }
+                        },
+                    });
+                } catch (err) {
+                    if (isRelayerError(err)) return relayerErrorResult(err);
+                    throw err;
+                }
+
+                return applyPullOutcome({
+                    supabase, req, sub, merchant, subscription_id,
+                    txHash: outcome.txHash,
+                    status: outcome.status,
+                    confirmationSeconds: Number(confirmationNs) / 1e9,
+                    extraBody: {
+                        sponsored: true,
+                        sponsor_address: relayer.sponsorAddress,
+                        fee_charged_stroops: outcome.feeCharged,
+                        attempts: outcome.attempts,
+                    },
+                });
+            });
+        });
+        if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
+        sendResult(res, result);
+    } catch (err) {
+        console.error("Error relaying pull:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/relay/budget', authenticateMerchant, async (req, res) => {
+    try {
+        if (!getSupabase()) return res.status(500).json({ error: "Supabase client not initialized" });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        res.status(200).json({ budget: await relayer.budgetStatus(req.merchant.id) });
+    } catch (err) {
+        console.error("Error fetching relayer budget:", err);
+        console.error("Error submitting pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /relay/sponsor-transaction (#169)
+ * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ */
+app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
+    try {
+        const { tx_xdr, network_passphrase } = req.body || {};
+        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const result = await relayer.sponsorTransaction({
+            txXdr: tx_xdr,
+            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
     }
 });
 
@@ -536,9 +1146,12 @@ app.post('/subscriptions', async (req, res) => {
         return res.status(400).json({ error: formatZodError(parseResult.error) });
     }
 
-    const { plan_id, customer_wallet_address, metadata } = parseResult.data;
-    const supabase = getSupabase();
+    const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
+    const supabase = getPrimarySupabase();
     if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
 
     const result = await executeIdempotently({
         supabase,
@@ -558,6 +1171,21 @@ app.post('/subscriptions', async (req, res) => {
     }, async () => {
         const nextBillingDate = new Date().toISOString();
 
+        // Look up the plan so fiat plans can capture the oracle rate as their
+        // slippage quote. Non-fatal: the insert below still verifies the plan
+        // through its foreign key.
+        let planRow = null;
+        try {
+            const { data: planData, error: planLookupError } = await supabase
+                .from('plans')
+                .select('merchant_id, currency, price_amount, usdc_amount')
+                .eq('id', plan_id);
+            if (planLookupError) throw planLookupError;
+            planRow = Array.isArray(planData) ? planData[0] : planData || null;
+        } catch (err) {
+            console.error("Error loading plan for subscription:", err.message);
+        }
+
         const insertPayload = {
             plan_id,
             customer_wallet_address,
@@ -565,11 +1193,44 @@ app.post('/subscriptions', async (req, res) => {
             metadata: metadata || {},
         };
 
-        const { data, error } = await supabase
-            .from('subscriptions')
-            .insert([insertPayload])
-            .select()
-            .single();
+        // Fiat plans: quote the fiat->USDC rate now. The pull flow later
+        // rejects settlements whose live rate moves more than 2% from it.
+        if (isFiatCurrency(planRow?.currency)) {
+            try {
+                const quote = await quoteUsdcAmount({
+                    supabase,
+                    plan: planRow,
+                    fetchImpl: app.locals.fetchImpl,
+                    allowNetwork: false,
+                    enforceSlippage: false,
+                });
+                insertPayload.quoted_rate = quote.rate;
+            } catch (err) {
+                // Cold rate cache: subscribe without a quote; the first pull stores one
+                console.error("Unable to quote subscription exchange rate:", err.message);
+            }
+        }
+
+        // A SQL function locks the coupon and atomically creates the
+        // subscription and increments redemptions_count; no read-then-write race.
+        let data, error;
+        if (coupon_code) {
+            const redeemed = await supabase.rpc('redeem_coupon_subscription', {
+                p_plan_id: plan_id,
+                p_customer_wallet_address: customer_wallet_address,
+                p_metadata: metadata || {},
+                p_code: normalizeCode(coupon_code),
+                p_quoted_rate: insertPayload.quoted_rate ?? null,
+            });
+            data = Array.isArray(redeemed.data) ? redeemed.data[0] : redeemed.data;
+            error = redeemed.error;
+            if (error?.code === 'P7501') return { status: 422, body: { error: 'Coupon invalid or incompatible with plan' } };
+            if (error?.code === 'P7502') return { status: 409, body: { error: 'Coupon redemption limit reached' } };
+            if (error?.code === 'P7503') return { status: 404, body: { error: 'Plan not found' } };
+        } else {
+            ({ data, error } = await supabase.from('subscriptions')
+                .insert([insertPayload]).select().single());
+        }
 
         if (isForeignKeyError(error)) return { status: 404, body: { error: "Plan not found" } };
         if (isUniqueViolation(error)) {
@@ -612,6 +1273,12 @@ app.post('/subscriptions', async (req, res) => {
             });
         }
 
+        if (merchantId) {
+            app.locals.paymentEventBus?.publish('subscriptionCreated', {
+                merchantId, subscriptionId: data.id,
+                id: data.id, status: data.status || 'active',
+            }).catch((error) => console.error('Subscription stream publish failed:', error));
+        }
         return { status: 201, body: { message: "Subscription created", subscription: data } };
     });
     sendResult(res, result);
@@ -775,9 +1442,12 @@ app.post('/dunning/process', async (req, res) => {
         const supabase = getSupabase();
         if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
         const merchant_id = req.body?.merchant_id;
+        // Use the merchant's saved dunning workflow when one exists (#190)
+        const workflow = await loadDunningWorkflow(supabase, merchant_id);
         const result = await processDunningRetries(supabase, {
             merchantId: merchant_id,
             fetchImpl: app.locals.fetchImpl,
+            workflowSteps: workflow?.steps || null,
         });
         res.status(200).json(result);
     } catch (err) {
@@ -786,7 +1456,7 @@ app.post('/dunning/process', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/recovery-link', async (req, res) => {
+app.post('/subscriptions/:id/recovery-link', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -800,8 +1470,14 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
-        const recovery = generateRecoveryLink(id);
+        if (sub.plans?.merchant_id !== req.merchant.id) return res.status(404).json({ error: 'Subscription not found' });
+
+        const recovery = generateRecoveryLink(id, { planId: sub.plan_id });
         res.status(200).json(recovery);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -811,7 +1487,7 @@ app.post('/subscriptions/:id/recovery-link', async (req, res) => {
 // ==========================================
 // ROUTE 8: CUSTOMER MANAGEMENT ACTIONS
 // ==========================================
-app.post('/subscriptions/:id/cancel', async (req, res) => {
+app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -825,6 +1501,10 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const changesBefore = { status: sub.status };
         const changesAfter = { status: 'cancelled', next_dunning_retry_at: null };
@@ -837,6 +1517,15 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
             .single();
 
         if (updateErr) throw updateErr;
+
+        // Cancelled subscribers lose their verifiable credentials immediately (#132).
+        // Verification also re-checks subscription status, so a failure here only
+        // delays the revocation record, never access.
+        try {
+            await credentialService.revocations.revokeSubscription(supabase, id, 'subscription_cancelled');
+        } catch (revokeErr) {
+            console.error("Error revoking credentials for cancelled subscription:", id, revokeErr);
+        }
 
         const merchantId = sub.plans?.merchant_id;
         await writeAuditLog(supabase, {
@@ -864,6 +1553,11 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
             });
         }
 
+        if (merchantId) {
+            app.locals.paymentEventBus?.publish('vaultCancelled', {
+                merchantId, subscriptionId: id, id, status: 'cancelled',
+            }).catch((error) => console.error('Subscription cancellation stream failed:', error));
+        }
         res.status(200).json({ message: "Subscription cancelled successfully", subscription: updated });
     } catch (err) {
         console.error("Error cancelling subscription:", err);
@@ -871,7 +1565,7 @@ app.post('/subscriptions/:id/cancel', async (req, res) => {
     }
 });
 
-app.post('/subscriptions/:id/refund', async (req, res) => {
+app.post('/subscriptions/:id/refund', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const { amount, reason, prorated } = req.body || {};
@@ -886,6 +1580,10 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const merchantId = sub.plans?.merchant_id;
         const refundAmount = amount ?? sub.plans?.usdc_amount;
@@ -932,7 +1630,7 @@ app.post('/subscriptions/:id/refund', async (req, res) => {
     }
 });
 
-app.get('/subscriptions/:id/timeline', async (req, res) => {
+app.get('/subscriptions/:id/timeline', authenticateMerchant, async (req, res) => {
     try {
         const { id } = req.params;
         const supabase = getSupabase();
@@ -946,6 +1644,10 @@ app.get('/subscriptions/:id/timeline', async (req, res) => {
 
         if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
         if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
 
         const { data: logs } = await supabase
             .from('audit_logs')
@@ -1236,6 +1938,62 @@ app.post('/webhooks/deliveries/:id/resend', async (req, res) => {
     }
 });
 
+// Webhook dead-letter queue (#229): deliveries that failed every automatic retry
+app.get('/webhooks/dead-letters', async (req, res) => {
+    try {
+        const { merchant_id, webhook_id, limit = 50, offset = 0 } = req.query;
+        if (!merchant_id) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        let query = supabase
+            .from('webhook_dead_letters')
+            .select('*', { count: 'exact' })
+            .eq('merchant_id', merchant_id);
+        if (webhook_id) query = query.eq('webhook_id', webhook_id);
+
+        const { data, count, error } = await query
+            .order('failed_at', { ascending: false })
+            .range(Number(offset), Number(offset) + Number(limit) - 1);
+        if (error) throw error;
+
+        res.status(200).json({
+            dead_letters: data || [],
+            total: count ?? (data?.length || 0),
+            limit: Number(limit),
+            offset: Number(offset),
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks/dead-letters/:id/replay', async (req, res) => {
+    try {
+        const merchantId = req.body?.merchant_id;
+        if (!merchantId) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const deadLetter = await replayDeadLetter(supabase, req.params.id, {
+            merchantId,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (!deadLetter) return res.status(404).json({ error: "Dead letter not found" });
+
+        res.status(200).json({
+            message: deadLetter.replay_status === 'success'
+                ? "Dead letter replayed successfully"
+                : "Dead letter replay failed; the endpoint is still rejecting deliveries",
+            dead_letter: deadLetter,
+        });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ error: err.message });
+        console.error("Error replaying webhook dead letter:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/webhooks/test', async (req, res) => {
     try {
         const { merchant_id, webhook_id, event_type = "payment.settled" } = req.body || {};
@@ -1285,6 +2043,7 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+<<<<<<< HEAD
 /// @route GET /api/verify/invoice/:invoiceId
 /// @desc Verify invoice cryptographic signature and return settlement details
 /// @access Merchant authenticated
@@ -1331,20 +2090,270 @@ app.get('/api/verify/invoice/:invoiceId', authenticateMerchant, async (req, res)
         });
     } catch (err) {
         console.error('Error verifying invoice:', err);
+=======
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+>>>>>>> upstream/main
         res.status(500).json({ error: err.message });
     }
 });
 
 registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
+registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
+registerRpcProxyRoute(app);
+registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
+registerCohortRoutes(app, getSupabase, authenticateMerchant);
+registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+
+// Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
+registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+
+// Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
+registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
+registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+registerCouponRoutes(app, getSupabase, authenticateMerchant);
+registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
+    resolveDispatcher: () => getPayoutSplitDispatcher(),
+});
+registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
+registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
+// orbit_db_pool_active (#230): connections checked out of the backend's pg pools
+setDbPoolSource(() => [
+    dbManager.primaryPool,
+    ...dbManager.replicaPools,
+    app.locals.reportPool,
+    app.locals.reportReplicaPool,
+]);
+registerIndexerRoutes(app);
+registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
+const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
+registerHandoverRoutes(app, getSupabase, {
+    rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+    contractId: process.env.ORBIT_CONTRACT_ID,
+    tokenContractId: process.env.USDC_CONTRACT_ID || process.env.TOKEN_CONTRACT_ID,
+});
+app.locals.paymentEventBus = createSubscriptionEventBus();
+app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
+
+// Merchant profile & custom contract persistence (#143)
+app.get('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        const { data, error } = await supabase
+            .from('merchants')
+            .select('id, name, wallet_address, contract_id, created_at')
+            .eq('id', req.merchant.id)
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getPrimarySupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        if (!dbManager.isPrimaryHealthy()) {
+            return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+        }
+        const updates = {};
+        if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+            updates.name = req.body.name.trim();
+        }
+        if (typeof req.body?.contract_id === 'string' && req.body.contract_id.trim()) {
+            updates.contract_id = req.body.contract_id.trim();
+        }
+        const { data, error } = await supabase
+            .from('merchants')
+            .update(updates)
+            .eq('id', req.merchant.id)
+            .select('id, name, wallet_address, contract_id, created_at')
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
+// never materializes the full transaction table in application memory.
+const getReportPool = () => {
+    return dbManager.getReportPool(app, { readOnly: true });
+};
+registerTransactionExportRoute(
+    app, authenticateMerchant, getReportPool,
+    (sql, values) => {
+        const Cursor = require('pg-cursor');
+        return new Cursor(sql, values);
+    },
+);
 
 const PORT = process.env.PORT || 3001;
-if (require.main === module) {
-    app.listen(PORT, () => {
+function startServer() {
+    if (getSupabase() && process.env.INDEXER_START_LEDGER) {
+        app.locals.ledgerIndexer = configuredIndexer(getSupabase());
+        app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
+    }
+    // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
+    // schedule so /rates and dynamic fiat billing always read fresh quotes.
+    const oracleSupabase = getSupabase();
+    if (process.env.RECURRING_PULLS_ENABLED === 'true' && !oracleSupabase) {
+        throw new Error('Supabase must be configured when recurring pulls are enabled');
+    }
+    if (oracleSupabase) {
+        app.locals.oracleWorker = startOracleWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        // Price indexation worker (#164): notifies subscribers inside the advance
+        // notice window and applies scheduled plan price changes on their
+        // effective date.
+        app.locals.priceIndexationWorker = createPriceIndexationWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        app.locals.priceIndexationWorker.start(
+            Number(process.env.PRICE_INDEXATION_INTERVAL_MS) || undefined,
+        );
+
+        // Daily contract state snapshot backup worker (#185): exports Soroban
+        // vaults, plans, and admin configs with SHA-256 integrity checksums.
+        if (process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID) {
+            app.locals.snapshotExportWorker = createSnapshotExportWorker({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                supabase: oracleSupabase,
+                contractId: process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID,
+            });
+            app.locals.snapshotExportWorker.start(
+                Number(process.env.SNAPSHOT_EXPORT_INTERVAL_MS) || undefined,
+            );
+        }
+
+        if (process.env.RECURRING_PULLS_ENABLED === 'true') {
+            const contractId = process.env.ORBIT_CONTRACT_ID;
+            if (!contractId) throw new Error('ORBIT_CONTRACT_ID is required when recurring pulls are enabled');
+            const relayer = getRelayer();
+            if (!relayer) throw new Error('RELAYER_SECRET_KEY is required when recurring pulls are enabled');
+            const signer = createRemoteMerchantSigner({
+                url: process.env.RECURRING_PULL_SIGNER_URL,
+                token: process.env.RECURRING_PULL_SIGNER_TOKEN,
+                fetchImpl: app.locals.fetchImpl,
+            });
+            const recurringPullOptions = {};
+            if (process.env.RECURRING_PULL_MAX_ATTEMPTS) {
+                const maxAttempts = Number(process.env.RECURRING_PULL_MAX_ATTEMPTS);
+                if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+                    throw new Error('RECURRING_PULL_MAX_ATTEMPTS must be a positive integer');
+                }
+                recurringPullOptions.maxAttempts = maxAttempts;
+            }
+            const recurringPullWorker = createRecurringPullWorker({
+                store: createRecurringPullStore(oracleSupabase),
+                relayer,
+                signer,
+                contractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                waitForTransaction: (hash, options) => waitForTransaction(
+                    getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                    hash,
+                    options,
+                ),
+                settle: async ({ sub, merchant, transactionHash, confirmation, settledAt, nextBillingDate }) => {
+                    await applyPullOutcome({
+                        supabase: oracleSupabase,
+                        req: null,
+                        sub,
+                        merchant,
+                        subscription_id: sub.id,
+                        txHash: transactionHash,
+                        status: confirmation.status,
+                        confirmation,
+                        extraBody: { automated: true },
+                        subscriptionAlreadySettled: true,
+                        settledAt,
+                        nextBillingDate,
+                    });
+                },
+                fail: async ({ sub, merchant, transactionHash, error }) => {
+                    await recordPullFailure(oracleSupabase, sub.id, error, transactionHash);
+                    await markSubscriptionPastDue(oracleSupabase, sub.id, {
+                        actorAddress: merchant.wallet_address,
+                        fetchImpl: app.locals.fetchImpl,
+                    });
+                },
+                options: recurringPullOptions,
+            });
+            app.locals.recurringPullWorker = startRecurringPullWorker(recurringPullWorker, {
+                intervalMs: Number(process.env.RECURRING_PULL_INTERVAL_MS) || undefined,
+            });
+        }
+    } else {
+        console.warn("Oracle worker not started: Supabase client not initialized");
+    }
+
+    const usageInterval = setInterval(() => {
+        const buffer = getUsageBuffer(), supabase = getSupabase();
+        if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
+    }, Number(process.env.USAGE_ROLLUP_INTERVAL_MS) || 300000);
+    usageInterval.unref();
+
+    const httpServer = app.listen(PORT, () => {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });
+    app.locals.graphqlServer.attachWebsocket(httpServer);
+}
+
+// Pre-flight schema guard (#157): never serve against a database whose
+// migrations don't match this build.
+if (require.main === module) {
+    checkSchemaOnStartup()
+        .then(startServer)
+        .catch((err) => {
+            console.error(`Startup aborted: ${err.message}`);
+            process.exit(1);
+        });
 }
 
 module.exports = app;
-
