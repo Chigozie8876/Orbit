@@ -183,7 +183,7 @@ function registerCustomerPortalRoutes(app, getSupabase, getSorobanServer) {
         if (!page) return res.status(400).json({ error: 'Invalid page or limit' });
         try {
             const { data, error } = await getSupabase().from('subscriptions')
-                .select('id,plan_id,status,next_billing_date,created_at,plans(name,merchant_id,merchants(name,wallet_address))')
+                .select('id,plan_id,status,next_billing_date,created_at,plans(name,merchant_id,usdc_amount,interval_seconds,merchants(name,wallet_address))')
                 .eq('customer_wallet_address', req.customerWallet).eq('status', 'active')
                 .order('created_at', { ascending: false }).range(page.from, page.to);
             if (error) throw error;
@@ -226,6 +226,40 @@ function registerCustomerPortalRoutes(app, getSupabase, getSorobanServer) {
             res.setHeader('Cache-Control', 'private, no-store');
             return res.send(JSON.stringify({ ...data, transaction_url: explorerUrl(data.tx_hash, network()),
                 note: 'Transaction confirmation only; no amount or tax invoice is asserted.' }, null, 2));
+        } catch (error) { return failed(res, error); }
+    });
+
+    app.post('/customer-portal/modify', requireCustomer, async (req, res) => {
+        const id = req.body?.subscription_id;
+        const amount = Number(req.body?.amount_usdc);
+        if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/i.test(id) || !Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({ error: 'Valid subscription_id and positive amount_usdc required' });
+        }
+        try {
+            const { data: sub, error } = await getSupabase().from('subscriptions')
+                .select('id,status,customer_wallet_address,plans(interval_seconds,merchants(wallet_address))')
+                .eq('id', id).eq('customer_wallet_address', req.customerWallet).maybeSingle();
+            if (error) throw error;
+            if (!sub) return res.status(404).json({ error: 'Subscription not found' });
+            const merchant = sub.plans?.merchants?.wallet_address;
+            const interval = Number(sub.plans?.interval_seconds);
+            const contractId = process.env.ORBIT_CONTRACT_ID;
+            if (!StrKey.isValidEd25519PublicKey(merchant || '') || !StrKey.isValidContract(contractId || '') || !Number.isSafeInteger(interval) || interval <= 0) {
+                return res.status(503).json({ error: 'Allowance update network is not configured' });
+            }
+            const rawAmount = BigInt(Math.round(amount * 1e7));
+            const soroban = getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org');
+            const account = await soroban.getAccount(req.customerWallet);
+            const tx = new TransactionBuilder(account, { fee: '1000000', networkPassphrase: network() })
+                .addOperation(new Contract(contractId).call('update_vault_terms',
+                    Address.fromString(req.customerWallet).toScVal(),
+                    Address.fromString(merchant).toScVal(),
+                    require('@stellar/stellar-sdk').nativeToScVal(rawAmount, { type: 'i128' }),
+                    require('@stellar/stellar-sdk').nativeToScVal(BigInt(interval), { type: 'u64' })))
+                .setTimeout(300).build();
+            const prepared = await soroban.prepareTransaction(tx);
+            res.setHeader('Cache-Control', 'no-store');
+            return res.json({ transaction_xdr: prepared.toEnvelope().toXdr('base64'), network_passphrase: network(), subscription_id: id });
         } catch (error) { return failed(res, error); }
     });
 
