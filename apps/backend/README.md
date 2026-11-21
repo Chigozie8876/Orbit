@@ -100,6 +100,8 @@ The service runs at `http://localhost:3001`.
 | `GET` | `/relay/budget` | API key | Today's sponsored fee usage and remaining budget |
 | `POST` | `/api/relayer/sponsor` | Public (policy-checked) | Fee-bump a subscriber-signed vault-creation transaction for gasless onboarding. `/relay/sponsor-transaction` is an alias |
 | `POST` | `/subscriptions` | Public | Record a customer subscription after handshake |
+| `POST` | `/api/promo/validate` | Public | Quote a promo code for a plan; refusals carry a `reason` (`invalid`, `expired`, `exhausted`, `not_applicable`). Alias of `/coupons/validate` |
+| `POST` | `/subscriptions/:id/balance-reminder` | API key | Email an at-risk subscriber a top-up link (24h cooldown per subscription) |
 | `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
 | `GET` | `/api-keys` | API key | List the merchant's API keys |
 | `DELETE` | `/api-keys/:id` | API key | Revoke an API key |
