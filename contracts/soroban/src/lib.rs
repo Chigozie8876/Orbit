@@ -3,6 +3,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, token,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Bytes,
     BytesN, Env, String, Symbol, Vec,
 };
@@ -27,6 +29,33 @@ pub const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 3 * 24 * 60 * 60;
 pub const PAYMENT_ACTIVE: u32 = 0;
 pub const PAYMENT_GRACE_PERIOD: u32 = 1;
 pub const PAYMENT_DEFAULTED: u32 = 2;
+/// Terminal state once a vault's ledger expiration or lifetime cap is reached.
+pub const PAYMENT_EXPIRED: u32 = 3;
+
+/// Explicit unbounded sentinels: ledger 0 is never reached by a live network,
+/// and -1 is the only negative lifetime cap accepted by validation.
+pub const UNLIMITED_EXPIRATION_LEDGER: u32 = 0;
+pub const UNLIMITED_LIFETIME_CAP: i128 = -1;
+
+/// Domain separator for the canonical Merkle reward leaf preimage.
+pub const REWARD_LEAF_DOMAIN: &[u8] = b"orbit:reward:leaf:v1";
+
+/// Structured errors for the #300/#302 features. Existing entrypoints keep
+/// their historical assertion messages; new guards expose stable codes.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum OrbitContractError {
+    InvalidMerkleProof = 300,
+    AlreadyClaimed = 301,
+    MissingMerkleRoot = 302,
+    InvalidRewardAmount = 303,
+    UnauthorizedRootUpdate = 304,
+    InvalidMerkleRoot = 305,
+    VaultExpired = 306,
+    LifetimeCapExceeded = 307,
+    InvalidVaultLimit = 308,
+}
 
 /// Sentinel `pull_sequence` for a vault that has never settled a pull.
 /// Lets the very first pull through while every later pull must advance the
@@ -145,6 +174,30 @@ pub struct VaultData {
     pub trial_end_timestamp: u64,
     /// Setup/onboarding fee charged on vault creation (#253)
     pub setup_fee: i128,
+    /// Ledger after which pulls are rejected. 0 means unbounded (#300).
+    pub expiration_ledger: u32,
+    /// Maximum lifetime disbursement. `UNLIMITED_LIFETIME_CAP` means unbounded (#300).
+    pub lifetime_cap_amount: i128,
+    /// Cumulative amount successfully pulled so far (#300).
+    pub total_pulled_amount: i128,
+}
+
+/// Exact v0.1.x vault layout. Used only to migrate vaults written before the
+/// #300 fields existed; new vaults always use `VaultData`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyVaultData {
+    pub token: Address,
+    pub amount_per_interval: i128,
+    pub interval_seconds: u64,
+    pub last_pull_timestamp: u64,
+    pub grace_period_seconds: u64,
+    pub payment_status: u32,
+    pub initial_timestamp: u64,
+    pub pull_sequence: u64,
+    pub is_paused: bool,
+    pub trial_end_timestamp: u64,
+    pub setup_fee: i128,
 }
 
 #[contracttype]
@@ -175,6 +228,8 @@ pub enum StorageKey {
 pub struct PaymentSplit {
     pub recipient: Address,
     pub amount: i128,
+    /// Token contract used for this recipient's payment (#301).
+    pub token: Address,
 }
 
 /// Per-subscriber outcome of a `batch_pull_funds` call (#92). `success` is false
@@ -525,6 +580,17 @@ pub enum FeatureKey {
     LoyaltyTiers(Address),
     /// Contract admin address (#255)
     Admin,
+    /// Global reward distribution root and token (#302)
+    RewardMerkleRoot,
+    RewardToken,
+    RewardClaim(Address),
+    /// Administrator authorized to rotate the reward root and fund claims. The
+    /// first `set_reward_root` call bootstraps it (deferring to the global admin
+    /// when one is configured); later rotations require the same address.
+    RewardAdmin,
+    /// Marks a vault stored with the #300 `VaultData` layout. Without it the
+    /// entry is decoded as `LegacyVaultData` and migrated on first read.
+    VaultLimitSchema(Address, Address),
 }
 
 // ----------------------------------------------------------------------------
@@ -818,12 +884,86 @@ fn vault_key(user: &Address, merchant: &Address) -> VaultKey {
     }
 }
 
+/// Marker distinguishing the extended #300 `VaultData` layout from v0.1.x
+/// entries that only contain the original fields.
+fn vault_schema_key(key: &VaultKey) -> FeatureKey {
+    FeatureKey::VaultLimitSchema(key.user.clone(), key.merchant.clone())
+}
+
 fn load_vault(env: &Env, key: &VaultKey) -> Option<VaultData> {
-    env.storage().persistent().get(key)
+    let storage = env.storage().persistent();
+    if storage.has(&vault_schema_key(key)) {
+        return storage.get(key);
+    }
+    // Backward-compatible migration: legacy vaults are unbounded and have
+    // pulled nothing since the cumulative counter did not exist yet.
+    storage.get::<_, LegacyVaultData>(key).map(|legacy| VaultData {
+        token: legacy.token,
+        amount_per_interval: legacy.amount_per_interval,
+        interval_seconds: legacy.interval_seconds,
+        last_pull_timestamp: legacy.last_pull_timestamp,
+        grace_period_seconds: legacy.grace_period_seconds,
+        payment_status: legacy.payment_status,
+        initial_timestamp: legacy.initial_timestamp,
+        pull_sequence: legacy.pull_sequence,
+        is_paused: legacy.is_paused,
+        trial_end_timestamp: legacy.trial_end_timestamp,
+        setup_fee: legacy.setup_fee,
+        expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
+        lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
+        total_pulled_amount: 0,
+    })
 }
 
 fn save_vault(env: &Env, key: &VaultKey, vault: &VaultData) {
     env.storage().persistent().set(key, vault);
+    let schema_key = vault_schema_key(key);
+    env.storage().persistent().set(&schema_key, &true);
+    let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+    env.storage()
+        .persistent()
+        .extend_ttl(&schema_key, threshold, extend_to);
+}
+
+/// 0 ledger and -1 amount are the explicit unbounded sentinels. Any other
+/// past/current ledger or non-positive cap is invalid configuration.
+fn validate_vault_limits(env: &Env, expiration_ledger: u32, lifetime_cap_amount: i128, sequence: u32) {
+    if expiration_ledger != UNLIMITED_EXPIRATION_LEDGER && expiration_ledger <= sequence {
+        panic_with_error!(env, OrbitContractError::InvalidVaultLimit);
+    }
+    if lifetime_cap_amount != UNLIMITED_LIFETIME_CAP && lifetime_cap_amount <= 0 {
+        panic_with_error!(env, OrbitContractError::InvalidVaultLimit);
+    }
+}
+
+/// Whether a pull must be rejected for the #300 guards. The terminal status is
+/// sticky even if the ledger clock is later rewound.
+fn vault_is_expired(env: &Env, vault: &VaultData) -> bool {
+    vault.payment_status == PAYMENT_EXPIRED
+        || (vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger)
+}
+
+/// The amount still available under the lifetime cap, or `None` if unbounded.
+fn remaining_vault_cap(vault: &VaultData) -> Option<i128> {
+    if vault.lifetime_cap_amount == UNLIMITED_LIFETIME_CAP {
+        return None;
+    }
+    Some(vault.lifetime_cap_amount - vault.total_pulled_amount)
+}
+
+fn mark_vault_expired(env: &Env, key: &VaultKey, vault: &VaultData) {
+    let mut expired = vault.clone();
+    expired.payment_status = PAYMENT_EXPIRED;
+    save_vault(env, key, &expired);
+    env.events().publish(
+        (
+            Symbol::new(env, "vault_expired"),
+            key.user.clone(),
+            key.merchant.clone(),
+        ),
+        (expired.total_pulled_amount, env.ledger().sequence()),
+    );
 }
 
 fn extend_feature_key(env: &Env, key: &FeatureKey, lifetime_seconds: u64) {
@@ -862,9 +1002,10 @@ fn remove_vault(env: &Env, user: &Address, merchant: &Address) {
     assert!(has_fixed || has_metered, "Vault does not exist");
 
     if has_fixed {
-        let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
+        let vault = load_vault(env, &key).expect("Vault missing");
         deactivate_badge(env, user, merchant, vault.interval_seconds);
         env.storage().persistent().remove(&key);
+        env.storage().persistent().remove(&vault_schema_key(&key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -905,6 +1046,37 @@ fn write_vault(
     trial_end_timestamp: u64,
     setup_fee: i128,
 ) {
+    write_vault_with_limits(
+        env,
+        user,
+        merchant,
+        token,
+        amount_per_interval,
+        interval_seconds,
+        grace_period_seconds,
+        trial_end_timestamp,
+        setup_fee,
+        UNLIMITED_EXPIRATION_LEDGER,
+        UNLIMITED_LIFETIME_CAP,
+    );
+}
+
+/// Same as `write_vault`, but with the optional #300 expiration and lifetime
+/// cap. Existing creation entrypoints deliberately keep unlimited semantics.
+#[allow(clippy::too_many_arguments)]
+fn write_vault_with_limits(
+    env: &Env,
+    user: &Address,
+    merchant: &Address,
+    token: &Address,
+    amount_per_interval: i128,
+    interval_seconds: u64,
+    grace_period_seconds: u64,
+    trial_end_timestamp: u64,
+    setup_fee: i128,
+    expiration_ledger: u32,
+    lifetime_cap_amount: i128,
+) {
     assert!(
         amount_per_interval > 0,
         "amount_per_interval must be positive"
@@ -913,11 +1085,14 @@ fn write_vault(
         interval_seconds > 0,
         "interval_seconds must be greater than zero"
     );
+    validate_vault_limits(
+        env,
+        expiration_ledger,
+        lifetime_cap_amount,
+        env.ledger().sequence(),
+    );
 
-    let key = VaultKey {
-        user: user.clone(),
-        merchant: merchant.clone(),
-    };
+    let key = vault_key(user, merchant);
 
     let vault_data = VaultData {
         token: token.clone(),
@@ -931,9 +1106,12 @@ fn write_vault(
         is_paused: false,
         trial_end_timestamp,
         setup_fee,
+        expiration_ledger,
+        lifetime_cap_amount,
+        total_pulled_amount: 0,
     };
 
-    env.storage().persistent().set(&key, &vault_data);
+    save_vault(env, &key, &vault_data);
 
     // Collect setup fee if specified (#253)
     if setup_fee > 0 {
@@ -1393,6 +1571,89 @@ impl OrbitContract {
         );
     }
 
+    /// Create a vault with an optional ledger expiration and lifetime pull cap
+    /// (#300). `expiration_ledger = 0` and `lifetime_cap_amount = -1` are the
+    /// explicit unbounded sentinels; all other non-positive values are rejected.
+    pub fn create_vault_with_limits(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        expiration_ledger: u32,
+        lifetime_cap_amount: i128,
+    ) {
+        user.require_auth();
+        validate_vault_limits(
+            &env,
+            expiration_ledger,
+            lifetime_cap_amount,
+            env.ledger().sequence(),
+        );
+        write_vault_with_limits(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+            0,
+            expiration_ledger,
+            lifetime_cap_amount,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_limits_configured"),
+                user,
+                merchant,
+            ),
+            (expiration_ledger, lifetime_cap_amount),
+        );
+    }
+
+    /// Update the optional limits of an existing vault. Subscriber-authorized,
+    /// matching the other vault configuration entrypoints. Expired vaults are
+    /// terminal and cannot be revived by raising the cap.
+    pub fn configure_vault_limits(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        expiration_ledger: u32,
+        lifetime_cap_amount: i128,
+    ) {
+        user.require_auth();
+        validate_vault_limits(
+            &env,
+            expiration_ledger,
+            lifetime_cap_amount,
+            env.ledger().sequence(),
+        );
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        if vault.payment_status == PAYMENT_EXPIRED {
+            panic_with_error!(&env, OrbitContractError::VaultExpired);
+        }
+        if lifetime_cap_amount != UNLIMITED_LIFETIME_CAP
+            && vault.total_pulled_amount > lifetime_cap_amount
+        {
+            panic_with_error!(&env, OrbitContractError::InvalidVaultLimit);
+        }
+        vault.expiration_ledger = expiration_ledger;
+        vault.lifetime_cap_amount = lifetime_cap_amount;
+        save_vault(&env, &key, &vault);
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_limits_configured"),
+                user,
+                merchant,
+            ),
+            (expiration_ledger, lifetime_cap_amount),
+        );
+    }
+
     /// Create a vault with an upfront setup fee collected on initialization (#253)
     pub fn create_vault_with_setup_fee(
         env: Env,
@@ -1454,6 +1715,8 @@ impl OrbitContract {
         );
     }
 
+    /// Create a vault with both trial period and setup fee (#253)
+    pub fn create_vault_with_trial_fee(
     /// Create a vault with both trial period and setup fee (#253).
     /// Named to fit Soroban's 32-character limit on contract function names;
     /// the original `create_vault_with_trial_and_setup_fee` (37) failed to build.
@@ -1678,11 +1941,15 @@ impl OrbitContract {
             is_paused: true,
             trial_end_timestamp: 0,
             setup_fee: 0,
+            expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
+            lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
+            total_pulled_amount: 0,
         };
 
         // Remove the old contract-level connection before creating the new one.
         deactivate_badge(&env, &user, &merchant, old_vault.interval_seconds);
         env.storage().persistent().remove(&old_key);
+        env.storage().persistent().remove(&vault_schema_key(&old_key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -2174,7 +2441,7 @@ impl OrbitContract {
             .checked_add(vault.interval_seconds)
             .expect("Due date overflow");
 
-        if vault.payment_status == PAYMENT_DEFAULTED {
+        if vault.payment_status == PAYMENT_DEFAULTED || vault.payment_status == PAYMENT_EXPIRED {
             return;
         }
         if current_time > due_date {
@@ -2371,6 +2638,11 @@ impl OrbitContract {
             vault.payment_status != PAYMENT_DEFAULTED,
             "Vault is defaulted"
         );
+        // #300: an expired vault (ledger sequence or terminal status) can never
+        // pull again, even if a later retry arrives within the billing interval.
+        if vault_is_expired(&env, &vault) {
+            panic_with_error!(&env, OrbitContractError::VaultExpired);
+        }
 
         if vault.last_pull_timestamp != 0 {
             assert!(
@@ -2393,17 +2665,29 @@ impl OrbitContract {
         // best matching tier; the discounted amount is what actually settles.
         let base_amount = vault.amount_per_interval;
         let discount_bps = loyalty_discount_bps(&env, &user, &merchant);
-        if discount_bps > 0 {
+        let pull_amount = if discount_bps > 0 {
             let settled = base_amount - base_amount * i128::from(discount_bps) / BPS_DENOMINATOR;
             assert!(settled > 0, "Loyalty discount would zero out the payment");
-            vault.amount_per_interval = settled;
+            settled
+        } else {
+            base_amount
+        };
+        // Check the actual settled amount, so a discounted pull cannot bypass
+        // the cap, and reject the whole request rather than partially paying.
+        if let Some(remaining) = remaining_vault_cap(&vault) {
+            if pull_amount > remaining {
+                panic_with_error!(&env, OrbitContractError::LifetimeCapExceeded);
+            }
+        }
+        if discount_bps > 0 {
+            vault.amount_per_interval = pull_amount;
             env.events().publish(
                 (
                     Symbol::new(&env, "loyalty_discount_applied"),
                     user.clone(),
                     merchant.clone(),
                 ),
-                (discount_bps, settled),
+                (discount_bps, pull_amount),
             );
         }
 
@@ -2446,11 +2730,22 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        // Cumulative accounting uses the amount actually transferred (#300).
+        vault.total_pulled_amount = vault
+            .total_pulled_amount
+            .checked_add(pull_amount)
+            .expect("Lifetime pull total overflow");
+        let cap_reached = remaining_vault_cap(&vault) == Some(0);
+        let expiration_reached = vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger;
         // Persist the full recurring charge; only this settlement was discounted.
         vault.amount_per_interval = base_amount;
         let amount_per_interval = vault.amount_per_interval;
         let interval_seconds = vault.interval_seconds;
         save_vault(&env, &key, &vault);
+        if cap_reached || expiration_reached {
+            mark_vault_expired(&env, &key, &vault);
+        }
 
         // Emit contract event
         env.events().publish(
@@ -2539,7 +2834,7 @@ impl OrbitContract {
         if vault.is_paused {
             return skipped(0);
         }
-        if vault.payment_status == PAYMENT_DEFAULTED {
+        if vault.payment_status == PAYMENT_DEFAULTED || vault_is_expired(env, &vault) {
             return skipped(0);
         }
 
@@ -2555,6 +2850,14 @@ impl OrbitContract {
             current_time.saturating_sub(vault.initial_timestamp) / vault.interval_seconds;
         if vault.pull_sequence != PULL_SEQUENCE_UNSET && cycle_index <= vault.pull_sequence {
             return skipped(0);
+        }
+
+        // The lifetime cap is a hard per-subscriber guard (#300). Skipping keeps
+        // the fault-tolerant batch semantics while preventing any over-pull.
+        if let Some(remaining) = remaining_vault_cap(&vault) {
+            if vault.amount_per_interval > remaining {
+                return skipped(0);
+            }
         }
 
         // Skip a subscriber whose balance cannot cover this interval instead of
@@ -2575,7 +2878,17 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        vault.total_pulled_amount = vault
+            .total_pulled_amount
+            .checked_add(amount)
+            .expect("Lifetime pull total overflow");
+        let cap_reached = remaining_vault_cap(&vault) == Some(0);
+        let expiration_reached = vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger;
         save_vault(env, &key, &vault);
+        if cap_reached || expiration_reached {
+            mark_vault_expired(env, &key, &vault);
+        }
 
         let tier = env
             .storage()
@@ -2947,12 +3260,31 @@ impl OrbitContract {
 
         let total_amount = validate_splits(&splits);
         let recipient_count = splits.len();
-        disburse(&env, &sender, &token, splits);
+        let totals = payroll_totals(&env, &splits);
+        // Validate every distinct token's allowance before routing any asset.
+        verify_payroll_allowances(&env, &sender, &splits);
+        disburse(&env, &sender, splits);
 
-        // Emit contract event
+        // Legacy aggregate event; `token` is kept for existing consumers while
+        // the summary event below reports per-asset totals (#301).
         env.events().publish(
-            (Symbol::new(&env, "batch_disbursed"), sender),
+            (Symbol::new(&env, "batch_disbursed"), sender.clone()),
             (token, recipient_count, total_amount),
+        );
+        let mut used_tokens = Vec::new(&env);
+        let mut volume_per_token = Vec::new(&env);
+        for (asset, volume) in totals.iter() {
+            used_tokens.push_back(asset);
+            volume_per_token.push_back(volume);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "payroll_summary"), sender),
+            (
+                used_tokens,
+                volume_per_token,
+                recipient_count,
+                env.ledger().sequence(),
+            ),
         );
     }
 
@@ -3064,20 +3396,27 @@ impl OrbitContract {
 
         let total_amount = validate_splits(&proposal.splits);
         let recipient_count = proposal.splits.len();
-        disburse(
-            &env,
-            &proposal.sender,
-            &proposal.token,
-            proposal.splits.clone(),
-        );
+        let totals = payroll_totals(&env, &proposal.splits);
+        verify_payroll_allowances(&env, &proposal.sender, &proposal.splits);
+        disburse(&env, &proposal.sender, proposal.splits.clone());
 
         env.events().publish(
             (
                 Symbol::new(&env, "payroll_executed"),
-                proposal.sender,
+                proposal.sender.clone(),
                 proposal_id,
             ),
             (proposal.token, recipient_count, total_amount),
+        );
+        let mut used_tokens = Vec::new(&env);
+        let mut volume_per_token = Vec::new(&env);
+        for (asset, volume) in totals.iter() {
+            used_tokens.push_back(asset);
+            volume_per_token.push_back(volume);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "payroll_summary"), proposal.sender, proposal_id),
+            (used_tokens, volume_per_token, recipient_count),
         );
     }
 
@@ -3825,6 +4164,132 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .has(&DataKey::MerkleClaimed(claim_id, leaf))
+    }
+
+    // --------------------------------------------------------------------
+    // ADMIN-CONFIGURED REWARD MERKLE ROOT (#302)
+    // --------------------------------------------------------------------
+
+    /// Stores the global reward Merkle root and the token used to pay claims.
+    /// Rotations require the reward administrator established by the first
+    /// call (the protocol admin when one is configured). The administrator must
+    /// also approve an allowance to this contract for claim payouts.
+    pub fn set_reward_root(env: Env, admin: Address, token: Address, root: BytesN<32>) {
+        admin.require_auth();
+        if root.to_array() == [0u8; 32] {
+            panic_with_error!(&env, OrbitContractError::InvalidMerkleRoot);
+        }
+        let reward_admin_key = FeatureKey::RewardAdmin;
+        match env.storage().persistent().get::<_, Address>(&reward_admin_key) {
+            Some(current) if current == admin => (),
+            Some(_) => panic_with_error!(&env, OrbitContractError::UnauthorizedRootUpdate),
+            None => {
+                // One-time bootstrap: use the protocol admin when available,
+                // otherwise the first caller becomes the reward administrator.
+                if let Some(global_admin) =
+                    env.storage().persistent().get::<_, Address>(&FeatureKey::Admin)
+                {
+                    if global_admin != admin {
+                        panic_with_error!(&env, OrbitContractError::UnauthorizedRootUpdate);
+                    }
+                }
+                env.storage().persistent().set(&reward_admin_key, &admin);
+                extend_feature_key(
+                    &env,
+                    &reward_admin_key,
+                    MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+                );
+            }
+        }
+        env.storage().persistent().set(&FeatureKey::RewardMerkleRoot, &root);
+        env.storage().persistent().set(&FeatureKey::RewardToken, &token);
+        extend_feature_key(
+            &env,
+            &FeatureKey::RewardMerkleRoot,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        extend_feature_key(
+            &env,
+            &FeatureKey::RewardToken,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "reward_root_set"), admin),
+            (token, root),
+        );
+    }
+
+    /// Current reward root, if one has been configured.
+    pub fn get_reward_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().persistent().get(&FeatureKey::RewardMerkleRoot)
+    }
+
+    /// Administrator authorized to rotate the reward root and fund claims.
+    pub fn get_reward_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&FeatureKey::RewardAdmin)
+    }
+
+    /// Whether `claimant` has already claimed against the reward root.
+    pub fn is_reward_claimed(env: Env, claimant: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&FeatureKey::RewardClaim(claimant))
+    }
+
+    /// Claims a reward if `(claimant, amount)` is a leaf of the configured
+    /// Merkle root. Leaf encoding is canonical (`reward_leaf`) and sibling
+    /// ordering is handled by `merkle_hash_pair`. The claimant signs, and each
+    /// address may claim at most once.
+    pub fn claim_reward(
+        env: Env,
+        claimant: Address,
+        amount: i128,
+        proof: Vec<BytesN<32>>,
+    ) {
+        claimant.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, OrbitContractError::InvalidRewardAmount);
+        }
+        let root: BytesN<32> = match env.storage().persistent().get(&FeatureKey::RewardMerkleRoot) {
+            Some(root) => root,
+            None => panic_with_error!(&env, OrbitContractError::MissingMerkleRoot),
+        };
+        let leaf = reward_leaf(&env, &claimant, amount);
+        if !verify_merkle_proof(&env, &proof, &root, &leaf) {
+            panic_with_error!(&env, OrbitContractError::InvalidMerkleProof);
+        }
+        let claim_key = FeatureKey::RewardClaim(claimant.clone());
+        if env.storage().persistent().has(&claim_key) {
+            panic_with_error!(&env, OrbitContractError::AlreadyClaimed);
+        }
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&FeatureKey::RewardToken)
+            .expect("Reward token is not configured");
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&FeatureKey::RewardAdmin)
+            .expect("No reward administrator configured");
+
+        // Mark before the external transfer; a failed transfer reverts both.
+        env.storage().persistent().set(&claim_key, &true);
+        extend_feature_key(
+            &env,
+            &claim_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &admin,
+            &claimant,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "reward_claimed"), claimant),
+            (token, amount),
+        );
     }
 
     // --------------------------------------------------------------------
@@ -4779,14 +5244,59 @@ fn validate_splits(splits: &Vec<PaymentSplit>) -> i128 {
     total_amount
 }
 
-/// Transfers each split from the sender's allowance to its recipient.
-fn disburse(env: &Env, sender: &Address, token: &Address, splits: Vec<PaymentSplit>) {
-    let token_client = token::Client::new(env, token);
+/// Aggregates required amounts per unique token contract, in first-appearance
+/// order so the summary event is deterministic.
+fn payroll_totals(env: &Env, splits: &Vec<PaymentSplit>) -> Vec<(Address, i128)> {
+    let mut totals: Vec<(Address, i128)> = Vec::new(env);
+    for split in splits.iter() {
+        let mut index = None;
+        for (position, entry) in totals.iter().enumerate() {
+            if entry.0 == split.token {
+                index = Some(position);
+                break;
+            }
+        }
+        match index {
+            Some(position) => {
+                let entry = totals.get(position as u32).expect("Token total missing");
+                let total = entry
+                    .1
+                    .checked_add(split.amount)
+                    .expect("Payroll token total overflow");
+                let mut rebuilt = Vec::new(env);
+                for (current, item) in totals.iter().enumerate() {
+                    if current == position {
+                        rebuilt.push_back((item.0, total));
+                    } else {
+                        rebuilt.push_back(item);
+                    }
+                }
+                totals = rebuilt;
+            }
+            None => totals.push_back((split.token.clone(), split.amount)),
+        }
+    }
+    totals
+}
 
-    // Loop through the array of contractors and amounts
+/// Verifies that the sender has approved enough of every distinct token used by
+/// the batch before any transfer is executed (#301).
+fn verify_payroll_allowances(env: &Env, sender: &Address, splits: &Vec<PaymentSplit>) {
+    let contract = env.current_contract_address();
+    for (token, required) in payroll_totals(env, splits).iter() {
+        let allowance = token::Client::new(env, &token).allowance(sender, &contract);
+        assert!(
+            allowance >= required,
+            "Insufficient allowance for payroll token"
+        );
+    }
+}
+
+/// Transfers each split in its own token contract. Atomicity is provided by
+/// Soroban: a failed transfer reverts every earlier transfer in the batch.
+fn disburse(env: &Env, sender: &Address, splits: Vec<PaymentSplit>) {
     for split in splits.into_iter() {
-        // Transfer the exact cut directly from the sender's wallet to the contractor
-        token_client.transfer_from(
+        token::Client::new(env, &split.token).transfer_from(
             &env.current_contract_address(),
             sender,
             &split.recipient,
@@ -4841,6 +5351,19 @@ fn save_merkle_payroll(env: &Env, claim_id: u64, payroll: &MerklePayrollData) {
     env.storage()
         .persistent()
         .extend_ttl(&key, threshold, extend_to);
+}
+
+/// Canonical reward leaf preimage: domain tag, then the length-prefixed
+/// Address XDR, then the amount as 16 big-endian bytes. Length-prefixing makes
+/// the encoding unambiguous and keeps leaves distinct from 64-byte inner nodes.
+pub fn reward_leaf(env: &Env, claimant: &Address, amount: i128) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = Bytes::from_slice(env, REWARD_LEAF_DOMAIN);
+    let address = claimant.clone().to_xdr(env);
+    data.extend_from_array(&address.len().to_be_bytes());
+    data.append(&address);
+    data.extend_from_array(&amount.to_be_bytes());
+    env.crypto().sha256(&data).to_bytes()
 }
 
 /// Merkle payroll leaf: `SHA256(recipient_xdr || amount as 16 big-endian bytes)`.

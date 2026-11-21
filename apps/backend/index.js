@@ -61,6 +61,10 @@ const {
     RateUnavailableError,
 } = require('./oracle');
 const {
+    createExchangeRateWorker,
+    buildRatePayload,
+} = require('./exchange-rates');
+const {
     createPayoutSplitDispatcher,
     createStellarSplitForwarder,
     registerPayoutSplitRoutes,
@@ -157,6 +161,20 @@ const dbManager = getDatabaseManager();
 const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(appInstance);
 const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
 const getSupabase = () => getPrimarySupabase(app);
+
+// Stellar asset rate worker (#303). Created lazily so importing the Express app
+// never opens a Redis connection; `startServer()` starts the actual timer.
+let defaultExchangeRateWorker;
+const getExchangeRateWorker = () => {
+    if (app.locals.exchangeRateWorker) return app.locals.exchangeRateWorker;
+    if (!defaultExchangeRateWorker) {
+        defaultExchangeRateWorker = createExchangeRateWorker({
+            getFetch: () => app.locals.fetchImpl || globalThis.fetch,
+            getSupabase: () => getSupabase(),
+        });
+    }
+    return defaultExchangeRateWorker;
+};
 
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
@@ -526,6 +544,24 @@ app.get('/rates', async (req, res) => {
         res.status(200).json(rates);
     } catch (err) {
         console.error("Error fetching exchange rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Structured Stellar asset rates (#303). Reads only the worker's cache so a
+// request never waits on an external oracle; stale/fallback data is labelled.
+app.get('/api/rates', async (req, res) => {
+    try {
+        const snapshot = await getExchangeRateWorker().readSnapshot();
+        const payload = buildRatePayload(snapshot);
+        res.set('Cache-Control', 'no-store');
+        res.set('X-Rate-Cache', payload.cache_status.toUpperCase());
+        res.set('X-Rate-Cache-Status', payload.cache_status);
+        res.set('X-Rate-Source', payload.rate_source || 'unknown');
+        res.set('X-Rate-Freshness', payload.fresh ? 'fresh' : 'stale');
+        res.status(200).json(payload);
+    } catch (err) {
+        console.error("Error fetching Stellar asset rates:", err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -2346,6 +2382,12 @@ function startServer() {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }
 
+    // Stellar exchange-rate worker (#303): runs independently of request
+    // handling even when no database is configured, and degrades to cache or
+    // static baselines rather than failing startup.
+    app.locals.exchangeRateWorker = getExchangeRateWorker();
+    app.locals.exchangeRateWorker.start();
+
     const usageInterval = setInterval(() => {
         const buffer = getUsageBuffer(), supabase = getSupabase();
         if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
@@ -2356,6 +2398,17 @@ function startServer() {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });
     app.locals.graphqlServer.attachWebsocket(httpServer);
+
+    let shuttingDown = false;
+    const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        app.locals.exchangeRateWorker?.stop();
+        app.locals.oracleWorker?.stop?.();
+        httpServer.close(() => process.exit(0));
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
 }
 
 // Pre-flight schema guard (#157): never serve against a database whose

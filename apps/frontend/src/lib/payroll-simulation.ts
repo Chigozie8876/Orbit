@@ -32,7 +32,7 @@ function toRawUnits(amount: number): bigint {
   return BigInt(Math.round(amount * 10 ** USDC_DECIMALS));
 }
 
-/** Encodes `Vec<PaymentSplit>` (a struct of `{ recipient, amount }`). */
+/** Encodes `Vec<PaymentSplit>` (a struct of `{ recipient, amount, token }`). */
 export function encodeSplits(recipients: PayrollRecipient[]): xdr.ScVal {
   const entries = recipients.map(
     (recipient) =>
@@ -47,6 +47,10 @@ export function encodeSplits(recipients: PayrollRecipient[]): xdr.ScVal {
       new xdr.ScMapEntry({
         key: xdr.ScVal.scvSymbol("amount"),
         val: nativeToScVal(toRawUnits(recipient.amount), { type: "i128" }),
+      }),
+      new xdr.ScMapEntry({
+        key: xdr.ScVal.scvSymbol("token"),
+        val: Address.fromString(USDC_CONTRACT_ID).toScVal(),
       }),
     ];
     return xdr.ScVal.scvMap(map);

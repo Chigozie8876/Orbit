@@ -357,14 +357,17 @@ fn test_batch_disburse_pays_every_recipient_correct_amount() {
     splits.push_back(PaymentSplit {
         recipient: recipient_1.clone(),
         amount: 10_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_2.clone(),
         amount: 20_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_3.clone(),
         amount: 30_0000000,
+        token: token_address.clone(),
     });
 
     orbit_client.batch_disburse(&sender, &token_address, &splits);
@@ -403,10 +406,12 @@ fn test_batch_disburse_reverts_fully_when_transfer_fails() {
     splits.push_back(PaymentSplit {
         recipient: recipient_1.clone(),
         amount: 20_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_2.clone(),
         amount: 20_0000000,
+        token: token_address.clone(),
     });
 
     let res = orbit_client.try_batch_disburse(&sender, &token_address, &splits);
@@ -618,10 +623,12 @@ fn test_batch_disburse_fails_when_split_amount_zero_and_no_recipient_paid() {
     splits.push_back(PaymentSplit {
         recipient: recipient_1.clone(),
         amount: 25_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_2.clone(),
         amount: 0,
+        token: token_address.clone(),
     });
 
     let res = orbit_client.try_batch_disburse(&sender, &token_address, &splits);
@@ -661,10 +668,12 @@ fn test_batch_disburse_fails_when_split_amount_negative_and_no_recipient_paid() 
     splits.push_back(PaymentSplit {
         recipient: recipient_1.clone(),
         amount: 30_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_2.clone(),
         amount: -10_0000000,
+        token: token_address.clone(),
     });
 
     let res = orbit_client.try_batch_disburse(&sender, &token_address, &splits);
@@ -751,10 +760,12 @@ fn test_contract_events_published_for_all_entrypoints() {
     splits.push_back(PaymentSplit {
         recipient: rec1,
         amount: 15_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: rec2,
         amount: 25_0000000,
+        token: token_address.clone(),
     });
 
     orbit_client.batch_disburse(&sender, &token_address, &splits);
@@ -765,9 +776,22 @@ fn test_contract_events_published_for_all_entrypoints() {
         sender.clone().to_val(),
     ];
     let disburse_data = (token_address.clone(), 2u32, 40_0000000i128).into_val(&env);
+    let summary_topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "payroll_summary").to_val(),
+        sender.clone().to_val(),
+    ];
+    let summary_data = (
+        soroban_sdk::vec![&env, token_address.clone()],
+        soroban_sdk::vec![&env, 40_0000000i128],
+        2u32,
+        env.ledger().sequence(),
+    )
+        .into_val(&env);
     let expected_disburse = soroban_sdk::vec![
         &env,
         (orbit_client.address.clone(), disburse_topics, disburse_data),
+        (orbit_client.address.clone(), summary_topics, summary_data),
     ];
     assert_eq!(
         env.events().all().filter_by_contract(&orbit_client.address),
@@ -973,10 +997,12 @@ fn setup_payroll<'a>() -> PayrollSetup<'a> {
     splits.push_back(PaymentSplit {
         recipient: recipient_1.clone(),
         amount: 10_0000000,
+        token: token_address.clone(),
     });
     splits.push_back(PaymentSplit {
         recipient: recipient_2.clone(),
         amount: 20_0000000,
+        token: token_address.clone(),
     });
 
     PayrollSetup {
@@ -1344,6 +1370,7 @@ fn test_propose_payroll_rejects_invalid_splits() {
     zero_split.push_back(PaymentSplit {
         recipient: Address::generate(&s.env),
         amount: 0,
+        token: s.token_address.clone(),
     });
     assert!(s
         .orbit_client
@@ -4655,6 +4682,270 @@ fn test_cancel_vault_with_signature() {
     assert_eq!(orbit.get_user_nonce(&user), 2);
 }
 
+// ----------------------------------------------------------------------------
+// ISSUE #300: VAULT EXPIRATION AND LIFETIME CAPS
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_expired_vault_cannot_be_pulled() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &token_address).mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &token_address).approve(
+        &user,
+        &orbit.address,
+        &100_0000000,
+        &2_000_000,
+    );
+
+    let expiration = env.ledger().sequence() + 10;
+    orbit.create_vault_with_limits(
+        &user,
+        &merchant,
+        &token_address,
+        &10_0000000,
+        &100,
+        &expiration,
+        &UNLIMITED_LIFETIME_CAP,
+    );
+
+    env.ledger().set_timestamp(500);
+    env.ledger().set_sequence_number(expiration);
+    assert!(orbit.try_pull_funds(&user, &merchant).is_err());
+    let vault = orbit.get_vault(&user, &merchant).unwrap();
+    assert_eq!(vault.payment_status, PAYMENT_EXPIRED);
+    assert_eq!(vault.total_pulled_amount, 0);
+}
+
+#[test]
+fn test_lifetime_cap_exhaustion_is_terminal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &token_address).mint(&user, &100_0000000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &token_address).approve(
+        &user,
+        &orbit.address,
+        &100_0000000,
+        &2_000_000,
+    );
+
+    orbit.create_vault_with_limits(
+        &user,
+        &merchant,
+        &token_address,
+        &10_0000000,
+        &100,
+        &0,
+        &20_0000000,
+    );
+
+    env.ledger().set_timestamp(150);
+    orbit.pull_funds(&user, &merchant);
+    env.ledger().set_timestamp(250);
+    orbit.pull_funds(&user, &merchant);
+
+    let vault = orbit.get_vault(&user, &merchant).unwrap();
+    assert_eq!(vault.total_pulled_amount, 20_0000000);
+    assert_eq!(vault.payment_status, PAYMENT_EXPIRED);
+
+    env.ledger().set_timestamp(350);
+    assert!(orbit.try_pull_funds(&user, &merchant).is_err());
+    assert!(orbit
+        .try_configure_vault_limits(&user, &merchant, &0, &50_0000000)
+        .is_err());
+}
+
+// ----------------------------------------------------------------------------
+// ISSUE #301: MULTI-TOKEN PAYROLL
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_batch_disburse_supports_distinct_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient_a = Address::generate(&env);
+    let recipient_b = Address::generate(&env);
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin_a)
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin_b)
+        .address();
+    StellarAssetClient::new(&env, &token_a).mint(&sender, &100);
+    StellarAssetClient::new(&env, &token_b).mint(&sender, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &token_a).approve(&sender, &orbit.address, &100, &2_000_000);
+    TokenClient::new(&env, &token_b).approve(&sender, &orbit.address, &100, &2_000_000);
+
+    let mut splits = Vec::new(&env);
+    splits.push_back(PaymentSplit {
+        recipient: recipient_a.clone(),
+        amount: 30,
+        token: token_a.clone(),
+    });
+    splits.push_back(PaymentSplit {
+        recipient: recipient_b.clone(),
+        amount: 40,
+        token: token_b.clone(),
+    });
+
+    orbit.batch_disburse(&sender, &token_a, &splits);
+
+    assert_eq!(TokenClient::new(&env, &token_a).balance(&recipient_a), 30);
+    assert_eq!(TokenClient::new(&env, &token_b).balance(&recipient_b), 40);
+    assert_eq!(TokenClient::new(&env, &token_a).balance(&recipient_b), 0);
+    assert_eq!(TokenClient::new(&env, &token_b).balance(&recipient_a), 0);
+}
+
+#[test]
+fn test_multi_token_payroll_requires_each_token_allowance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    StellarAssetClient::new(&env, &token_a).mint(&sender, &100);
+    StellarAssetClient::new(&env, &token_b).mint(&sender, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &token_a).approve(&sender, &orbit.address, &100, &2_000_000);
+    TokenClient::new(&env, &token_b).approve(&sender, &orbit.address, &9, &2_000_000);
+
+    let mut splits = Vec::new(&env);
+    splits.push_back(PaymentSplit {
+        recipient: recipient.clone(),
+        amount: 10,
+        token: token_a.clone(),
+    });
+    splits.push_back(PaymentSplit {
+        recipient,
+        amount: 10,
+        token: token_b.clone(),
+    });
+
+    assert!(orbit.try_batch_disburse(&sender, &token_a, &splits).is_err());
+    assert_eq!(TokenClient::new(&env, &token_a).balance(&sender), 100);
+    assert_eq!(TokenClient::new(&env, &token_b).balance(&sender), 100);
+}
+
+// ----------------------------------------------------------------------------
+// ISSUE #302: MERKLE REWARD CLAIMS
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_merkle_reward_claim_is_verified_and_single_use() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let claimant_a = Address::generate(&env);
+    let claimant_b = Address::generate(&env);
+    let reward_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    StellarAssetClient::new(&env, &reward_token).mint(&admin, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    TokenClient::new(&env, &reward_token).approve(&admin, &orbit.address, &100, &2_000_000);
+
+    let leaf_a = reward_leaf(&env, &claimant_a, 30);
+    let leaf_b = reward_leaf(&env, &claimant_b, 40);
+    let root = merkle_hash_pair(&env, &leaf_a, &leaf_b);
+    orbit.set_reward_root(&admin, &reward_token, &root);
+    assert_eq!(orbit.get_reward_root(), Some(root.clone()));
+    assert_eq!(orbit.get_reward_admin(), Some(admin.clone()));
+
+    orbit.claim_reward(&claimant_a, &30, &soroban_sdk::vec![&env, leaf_b.clone()]);
+    assert_eq!(TokenClient::new(&env, &reward_token).balance(&claimant_a), 30);
+    assert!(orbit.is_reward_claimed(&claimant_a));
+    assert!(orbit
+        .try_claim_reward(&claimant_a, &30, &soroban_sdk::vec![&env, leaf_b.clone()])
+        .is_err());
+
+    orbit.claim_reward(&claimant_b, &40, &soroban_sdk::vec![&env, leaf_a]);
+    assert_eq!(TokenClient::new(&env, &reward_token).balance(&claimant_b), 40);
+
+    // Wrong amount yields a different leaf, so the proof no longer verifies.
+    assert!(orbit
+        .try_claim_reward(
+            &Address::generate(&env),
+            &31,
+            &soroban_sdk::vec![&env, leaf_b]
+        )
+        .is_err());
+
+    let outsider = Address::generate(&env);
+    assert!(orbit
+        .try_set_reward_root(
+            &outsider,
+            &reward_token,
+            &BytesN::from_array(&env, &[9u8; 32])
+        )
+        .is_err());
+}
+
+#[test]
+fn test_reward_root_and_claim_reject_invalid_inputs() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+    let reward_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    assert!(orbit
+        .try_set_reward_root(
+            &admin,
+            &reward_token,
+            &BytesN::from_array(&env, &[0u8; 32])
+        )
+        .is_err());
+    assert!(orbit.try_claim_reward(&claimant, &1, &Vec::new(&env)).is_err());
+
+    let root = BytesN::from_array(&env, &[7u8; 32]);
+    orbit.set_reward_root(&admin, &reward_token, &root);
+    assert!(orbit.try_claim_reward(&claimant, &0, &Vec::new(&env)).is_err());
+    assert!(orbit
+        .try_claim_reward(&claimant, &1, &soroban_sdk::vec![&env, root])
+        .is_err());
 // ---------------------------------------------------------------------------
 // #296: delegated vault authorization via typed signatures
 // ---------------------------------------------------------------------------
