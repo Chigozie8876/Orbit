@@ -51,6 +51,7 @@ import { DevelopersView } from "./views/developers-view";
 import { RetentionView } from "./views/retention-view";
 import { NotificationTemplatesView } from "./views/notification-templates-view";
 import { TeamView } from "./views/team-view";
+import { TaxComplianceView } from "./views/tax-compliance-view";
 import { LocaleSwitcher } from "@/components/layout/locale-switcher";
 import { VaultModal } from "./modals/vault-modal";
 import { DeployVaultModal } from "./modals/deploy-vault-modal";
@@ -248,6 +249,12 @@ export function DashboardShell() {
       label: t("nav.team"),
       icon: UserCog,
       badge: null,
+    },
+    {
+      id: "tax" as DashboardTab,
+      label: t("nav.tax"),
+      icon: ShieldCheck,
+      badge: "IRS/VAT",
     },
     {
       id: "developers" as DashboardTab,
@@ -606,6 +613,8 @@ export function DashboardShell() {
           )}
 
           {activeTab === "team" && <TeamView />}
+
+          {activeTab === "tax" && <TaxComplianceView />}
 
           {activeTab === "developers" && <DevelopersView />}
         </main>

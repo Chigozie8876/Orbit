@@ -10,6 +10,7 @@ export type DashboardTab =
   | "domains"
   | "links"
   | "team"
+  | "tax"
   | "developers";
 
 export type NetworkId = "stellar-testnet" | "stellar-futurenet" | "stellar-local";

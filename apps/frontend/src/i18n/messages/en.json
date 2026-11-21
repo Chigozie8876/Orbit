@@ -66,6 +66,7 @@
       "domains": "Custom Domains",
       "links": "Payment Links",
       "team": "Team & Permissions",
+      "tax": "Tax & Compliance",
       "developers": "Developer Portal",
       "retention": "Retention",
       "templates": "Email Templates"
@@ -86,6 +87,7 @@
       "domains": "Custom Domains & SSL",
       "links": "Payment Links",
       "team": "Team & Permissions",
+      "tax": "Tax & Compliance",
       "developers": "Developer Portal",
       "retention": "Cohort Retention",
       "templates": "Email Templates"

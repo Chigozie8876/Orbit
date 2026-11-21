@@ -89,6 +89,8 @@ const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute, createIpWindowLimiter: createRpcIpWindowLimiter } = require('./rpc-proxy');
 const { SimulationCache, getOrSimulate } = require('./simulation-cache');
 const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
+const { registerStorageHealthRoutes } = require('./storage-health');
+const { createDisputeAlertProcessor } = require('./dispute-alert-processor');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
 const { registerPaymentLinkRoutes } = require('./payment-links');
@@ -2246,6 +2248,11 @@ registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
 registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
 registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
 registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
+registerStorageHealthRoutes(app);
+app.locals.disputeAlertProcessor = createDisputeAlertProcessor({
+    supabase: getSupabase(),
+    frontendUrl: process.env.FRONTEND_URL || 'https://useorbit.xyz',
+});
 // orbit_db_pool_active (#230): connections checked out of the backend's pg pools
 setDbPoolSource(() => [
     dbManager.primaryPool,
