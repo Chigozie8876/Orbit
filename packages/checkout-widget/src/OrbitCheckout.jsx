@@ -50,6 +50,11 @@ import {
   payWithAssetsFor,
 } from "./swap";
 import {
+  fetchFeeStats,
+  parseFeeStats,
+  calculateFeeBreakdown,
+} from "./feeEstimation";
+import {
   isPasskeySupported,
   authenticateOrRegisterPasskey,
   PasskeyWalletAdapter,
@@ -904,6 +909,29 @@ export default function OrbitCheckout({
     };
   }, [address, horizonUrl, payWithAssets, isDemo, balanceRefreshTick]);
 
+  // Dynamic Horizon Fee Stats & Congestion Monitoring
+  const [feeStats, setFeeStats] = useState(() => parseFeeStats(null));
+  const [feeBidType, setFeeBidType] = useState("recommended"); // "recommended" | "standard"
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchFeeStats({ horizonUrl })
+      .then((stats) => {
+        if (!cancelled) setFeeStats(stats);
+      })
+      .catch(() => {
+        if (!cancelled) setFeeStats(parseFeeStats(null));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [horizonUrl, balanceRefreshTick]);
+
+  const feeBreakdown = useMemo(
+    () => calculateFeeBreakdown({ feeStats, feeBidType, operationsCount: isSessionKey ? 1 : 2 }),
+    [feeStats, feeBidType, isSessionKey],
+  );
+
   useEffect(() => () => bridgeWatcher.current?.stop(), []);
 
   // Starts watching the connected Stellar address for the bridged USDC to land, so the
@@ -1211,6 +1239,7 @@ export default function OrbitCheckout({
           apiUrl,
           sponsorFees: true,
           includeTrustline: true,
+          baseFee: feeBreakdown.feePerOpStroops,
           onSubmitted: ({ stage, hash, sponsored }) => {
             localStorage.setItem(
               PENDING_KEY,
@@ -1236,6 +1265,7 @@ export default function OrbitCheckout({
           tokenContractId,
           rpcUrl,
           networkPassphrase,
+          baseFee: feeBreakdown.feePerOpStroops,
         });
         setFeeEstimate(preflight);
         hashes = await authorizePlan({
@@ -1248,6 +1278,7 @@ export default function OrbitCheckout({
           tokenContractId,
           rpcUrl,
           networkPassphrase,
+          baseFee: feeBreakdown.feePerOpStroops,
           preflight,
           onSubmitted: ({ stage, hash }) => {
             localStorage.setItem(
@@ -1990,6 +2021,140 @@ export default function OrbitCheckout({
                 Demo mode never signs transactions or creates a subscription.
               </p>
             )}
+
+            {/* Network Status & Dynamic Fee Breakdown (#Task 1) */}
+            {!isDemo && (
+              <div className="orbit-fee-section" style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, color: "var(--orbit-muted)", fontWeight: 500 }}>Stellar Network:</span>
+                  <span
+                    className="orbit-network-status-badge"
+                    data-testid="network-status-badge"
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "3px 8px",
+                      borderRadius: "999px",
+                      background: feeStats.isCongested ? "rgba(245, 158, 11, 0.15)" : "rgba(16, 185, 129, 0.12)",
+                      color: feeStats.isCongested ? "#b45309" : "#047857",
+                      border: feeStats.isCongested ? "1px solid rgba(245, 158, 11, 0.3)" : "1px solid rgba(16, 185, 129, 0.2)",
+                    }}
+                  >
+                    {feeStats.badge}
+                  </span>
+                </div>
+
+                {feeStats.isCongested && (
+                  <div
+                    role="alert"
+                    className="orbit-congestion-warning"
+                    style={{
+                      background: "rgba(245, 158, 11, 0.1)",
+                      border: "1px solid rgba(245, 158, 11, 0.35)",
+                      borderRadius: "var(--orbit-radius)",
+                      padding: "10px 12px",
+                      marginBottom: 10,
+                      fontSize: 12,
+                      textAlign: "left",
+                      color: "#92400e",
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    <strong>High Network Traffic:</strong> Transactions with standard fees may be delayed.
+                    Suggested fee adjustment: <strong>+{feeStats.feeBumpStroops} stroops</strong> (+{(feeStats.feeBumpStroops / 10000000).toFixed(7)} XLM) for guaranteed next-ledger inclusion.
+                  </div>
+                )}
+
+                {/* Fee bid selection */}
+                <div
+                  className="orbit-fee-bid-selection"
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: 8,
+                    marginBottom: 10,
+                  }}
+                >
+                  <button
+                    type="button"
+                    style={{
+                      padding: "8px",
+                      borderRadius: "var(--orbit-radius)",
+                      border: feeBidType === "recommended" ? "2px solid var(--orbit-accent)" : "1px solid rgba(0,0,0,0.15)",
+                      background: feeBidType === "recommended" ? "rgba(99, 102, 241, 0.08)" : "transparent",
+                      textAlign: "left",
+                      cursor: "pointer",
+                      fontSize: 11,
+                    }}
+                    onClick={() => setFeeBidType("recommended")}
+                  >
+                    <div style={{ fontWeight: 600, color: "var(--orbit-text)" }}>
+                      Recommended {feeStats.isCongested ? "(Surge Boost)" : ""}
+                    </div>
+                    <div style={{ color: "var(--orbit-muted)", fontSize: 10, marginTop: 2 }}>
+                      {feeStats.recommendedFeeStroops} stroops (~{feeStats.recommendedFeeXlm} XLM)
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    style={{
+                      padding: "8px",
+                      borderRadius: "var(--orbit-radius)",
+                      border: feeBidType === "standard" ? "2px solid var(--orbit-accent)" : "1px solid rgba(0,0,0,0.15)",
+                      background: feeBidType === "standard" ? "rgba(99, 102, 241, 0.08)" : "transparent",
+                      textAlign: "left",
+                      cursor: "pointer",
+                      fontSize: 11,
+                    }}
+                    onClick={() => setFeeBidType("standard")}
+                  >
+                    <div style={{ fontWeight: 600, color: "var(--orbit-text)" }}>Standard Base Fee</div>
+                    <div style={{ color: "var(--orbit-muted)", fontSize: 10, marginTop: 2 }}>
+                      {feeStats.standardFeeStroops} stroops (~{feeStats.standardFeeXlm} XLM)
+                    </div>
+                  </button>
+                </div>
+
+                {/* Network Fee Breakdown */}
+                <div
+                  className="orbit-fee-breakdown"
+                  style={{
+                    background: "rgba(0, 0, 0, 0.03)",
+                    border: "1px solid rgba(0, 0, 0, 0.08)",
+                    borderRadius: "var(--orbit-radius)",
+                    padding: "8px 10px",
+                    fontSize: 11,
+                    textAlign: "left",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                    <span style={{ color: "var(--orbit-muted)" }}>Base Bid ({feeBreakdown.operationsCount} op{feeBreakdown.operationsCount > 1 ? "s" : ""}):</span>
+                    <span>~{feeBreakdown.baseFeeTotalXlm} XLM</span>
+                  </div>
+                  {feeStats.isCongested && feeBidType === "recommended" && (
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3, color: "#b45309" }}>
+                      <span>Surge Fee Adjustment:</span>
+                      <span>+{feeBreakdown.surgeBumpTotalXlm} XLM</span>
+                    </div>
+                  )}
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      paddingTop: 4,
+                      marginTop: 3,
+                      borderTop: "1px dashed rgba(0, 0, 0, 0.12)",
+                      fontWeight: 600,
+                    }}
+                  >
+                    <span>Total Estimated Fee:</span>
+                    <span>{feeBreakdown.totalFeeStroops} stroops (~{feeBreakdown.totalFeeXlm} XLM)</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <button
               className={customClasses.button}
               style={{

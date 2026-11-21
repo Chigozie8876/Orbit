@@ -498,6 +498,7 @@ fn test_compact_layout_round_trips_vault_data() {
             pull_sequence: 0,
             is_paused: false,
             trial_end_timestamp: 0,
+            setup_fee: 0,
         })
     );
     let vault = f.client.get_vault(&f.user, &merchant).unwrap();

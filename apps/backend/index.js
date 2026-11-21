@@ -83,6 +83,7 @@ const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute } = require('./rpc-proxy');
 const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
+const { registerExternalReconciliationRoutes } = require('./external-reconciliation');
 const { registerCredentialRoutes } = require('./credentials');
 const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
@@ -2114,6 +2115,7 @@ setDbPoolSource(() => [
 ]);
 registerIndexerRoutes(app);
 registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
+registerExternalReconciliationRoutes(app, getSupabase);
 const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
 registerHandoverRoutes(app, getSupabase, {
     rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',

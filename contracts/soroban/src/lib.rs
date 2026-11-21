@@ -1415,7 +1415,7 @@ impl OrbitContract {
     }
 
     /// Create a vault with both trial period and setup fee (#253)
-    pub fn create_vault_with_trial_and_setup_fee(
+    pub fn create_vault_trial_setup_fee(
         env: Env,
         user: Address,
         merchant: Address,
@@ -4304,6 +4304,7 @@ impl OrbitContract {
             amount_per_interval,
             interval_seconds,
             DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
             0,
         );
         env.events().publish(
