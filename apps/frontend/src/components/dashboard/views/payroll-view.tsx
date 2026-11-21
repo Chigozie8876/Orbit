@@ -25,6 +25,7 @@ import {
   Lock,
   ArrowRight,
   Shield,
+  Calculator,
 } from "lucide-react";
 import { connectFreighter } from "@/lib/freighter";
 import { signMessage } from "@stellar/freighter-api";
@@ -38,6 +39,7 @@ import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRe
 import { simulatePayrollRun } from "@/lib/payroll-simulation";
 import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
 import { MilestonePayrollPanel } from "./milestone-payroll-panel";
+import { SplitCalculator } from "../split-calculator";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -131,6 +133,7 @@ export function PayrollView() {
   const [uploadErrors, setUploadErrors] = useState<RowValidationError[]>([]);
   const [editedAmounts, setEditedAmounts] = useState<Record<string, string>>({});
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [showSplitCalculator, setShowSplitCalculator] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const duplicates = useMemo(() => duplicateWallets(recipients), [recipients]);
   const preflightErrors = useMemo(() => {
@@ -1018,8 +1021,32 @@ export function PayrollView() {
           >
             Reset Demo
           </button>
+          <button
+            onClick={() => setShowSplitCalculator((prev) => !prev)}
+            className={`button text-xs h-9 px-3 flex items-center gap-1.5 transition-all ${
+              showSplitCalculator
+                ? "bg-indigo-600 text-white border-indigo-700 shadow-xs"
+                : "button-secondary"
+            }`}
+            title="Toggle interactive team split calculator"
+          >
+            <Calculator size={13} />
+            <span>Split Calculator</span>
+          </button>
         </div>
       </div>
+
+      {/* Interactive Split Calculator */}
+      {showSplitCalculator && (
+        <SplitCalculator
+          onApplyToBatch={(newRecipients) => {
+            setRecipients(newRecipients);
+            setDisbursedSuccess(null);
+            setUploadErrors([]);
+            setEditedAmounts({});
+          }}
+        />
+      )}
 
       {/* Success Notification Banner */}
       {disbursedSuccess && (

@@ -76,19 +76,20 @@ const typeDefs = parse(`
 `);
 
 const badInput = (message) => { throw new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } }); };
-const GRAPHQL_MAX_DEPTH = 6;
+const GRAPHQL_MAX_DEPTH = 8;
 const GRAPHQL_MAX_COMPLEXITY = 1000;
 const GRAPHQL_INTERNAL_MAX_COMPLEXITY = 10000;
 
-function queryValidation(document) {
+function queryValidation(document, options = {}) {
     const fragments = new Map(document.definitions.filter((d) => d.kind === 'FragmentDefinition')
         .map((d) => [d.name.value, d]));
     let totalCost = 0;
     const fieldWeights = { payments: 25, payrollSplits: 20, subscriptions: 15, plans: 10 };
+    const maxDepth = options.internalService ? 12 : GRAPHQL_MAX_DEPTH;
     function walk(selectionSet, depth = 1, seen = new Set()) {
         if (!selectionSet) return;
-        if (depth > GRAPHQL_MAX_DEPTH) {
-            throw new GraphQLError(`GraphQL query depth exceeds maximum of ${GRAPHQL_MAX_DEPTH}`, {
+        if (depth > maxDepth) {
+            throw new GraphQLError(`GraphQL query depth exceeds maximum of ${maxDepth}`, {
                 extensions: { code: 'GRAPHQL_DEPTH_EXCEEDED' },
             });
         }
@@ -105,7 +106,15 @@ function queryValidation(document) {
             }
             const name = selection.name?.value || '';
             const argumentsCost = selection.arguments?.length ? 2 : 0;
-            totalCost += 1 + argumentsCost + (fieldWeights[name] || 0);
+            let limitMultiplier = 1;
+            const paginationArg = selection.arguments?.find((a) => a.name?.value === 'pagination');
+            if (paginationArg?.value?.fields) {
+                const limitField = paginationArg.value.fields.find((f) => f.name?.value === 'limit');
+                if (limitField?.value?.value) {
+                    limitMultiplier = Math.max(1, parseInt(limitField.value.value, 10) || 1);
+                }
+            }
+            totalCost += (1 + argumentsCost + (fieldWeights[name] || 0)) * limitMultiplier;
             if (selection.selectionSet) walk(selection.selectionSet, depth + 1, seen);
         }
     }
@@ -120,7 +129,7 @@ function validateGraphqlQuery(source, options = {}) {
     let document;
     try { document = parse(source); }
     catch (error) { throw new GraphQLError(error.message, { extensions: { code: 'GRAPHQL_PARSE_FAILED' } }); }
-    const cost = queryValidation(document);
+    const cost = queryValidation(document, options);
     const maxCost = options.internalService ? GRAPHQL_INTERNAL_MAX_COMPLEXITY : GRAPHQL_MAX_COMPLEXITY;
     if (cost > maxCost) {
         throw new GraphQLError(`GraphQL query complexity ${cost} exceeds maximum budget ${maxCost}`, {

@@ -66,6 +66,7 @@
       "domains": "Domínios personalizados",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
+      "tax": "Impostos e conformidade",
       "developers": "Portal do desenvolvedor",
       "retention": "Retention",
       "templates": "Email Templates"
@@ -86,6 +87,7 @@
       "domains": "Domínios personalizados e SSL",
       "links": "Links de pagamento",
       "team": "Equipe e permissões",
+      "tax": "Impostos e conformidade",
       "developers": "Portal do desenvolvedor",
       "retention": "Cohort Retention",
       "templates": "Email Templates"
