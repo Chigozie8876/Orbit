@@ -9,6 +9,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Brand } from "./brand";
 import { useAuth } from "@/lib/auth-context";
 import { DOCS_URL } from "@/lib/links";
+import { CurrencyRateTicker } from "@/components/layout/CurrencyRateTicker";
 
 export function Navbar() {
   const [isOpen, setIsOpen] = useState(false);
@@ -74,6 +75,7 @@ export function Navbar() {
               >
                 Sign out
               </button>
+              <CurrencyRateTicker />
             </div>
           ) : (
             <>

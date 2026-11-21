@@ -1,26 +1,26 @@
 #![no_std]
 #![allow(deprecated)]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec, Bytes};
+
+/// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
+pub const SECONDS_PER_LEDGER: u64 = 5;
 
 // ----------------------------------------------------------------------------
 // CONSTANTS: STATE ARCHIVAL & TTL MANAGEMENT
 // ----------------------------------------------------------------------------
 
-/// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
-pub const SECONDS_PER_LEDGER: u64 = 5;
-
 /// Safety margin added to interval ledgers (approx. 7 days = 120,960 ledgers)
 /// to ensure vaults remain active even if automated pulls are delayed.
 pub const TTL_MARGIN_LEDGERS: u32 = 120_960;
 
-/// Base minimum TTL duration in ledgers (approx. 30 days = 518,400 ledgers).
+// Base minimum TTL duration in ledgers (approx. 30 days = 518,400 ledgers).
 pub const MIN_TTL_LEDGERS: u32 = 518_400;
 
-/// Threshold in ledgers below which TTL will be extended (approx. 7 days = 120,960 ledgers).
+// Threshold in ledgers below which TTL will be extended (approx. 7 days = 120,960 ledgers).
 pub const TTL_THRESHOLD_LEDGERS: u32 = 120_960;
 
-/// Calculates (threshold, extend_to) in ledgers for vault persistent storage
+// Calculates (threshold, extend_to) in ledgers for vault persistent storage
 /// and contract instance storage based on interval_seconds.
 pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
     let interval_ledgers = (interval_seconds / SECONDS_PER_LEDGER) as u32;
@@ -56,6 +56,17 @@ pub struct VaultData {
 pub struct PaymentSplit {
     pub recipient: Address,
     pub amount: i128,
+}
+
+// ----------------------------------------------------------------------------
+// DELEGATED DISBURSE STRUCTURES
+// ----------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisbursalNonce {
+    pub sender: Address,
+    pub nonce: u64,
 }
 
 // ----------------------------------------------------------------------------
@@ -222,6 +233,64 @@ impl OrbitContract {
             (Symbol::new(&env, "batch_disbursed"), sender),
             (token, recipient_count, total_amount),
         );
+    }
+
+    /// Delegated batch disbursement allowing relayers to submit signed disbursements
+    /// on behalf of the sender. Verifies the sender's Ed25519 signature, checks nonce
+    /// validity to prevent replay attacks, and enforces a deadline ledger.
+    pub fn batch_disburse_delegated(
+        env: Env,
+        sender: Address,
+        token: Address,
+        nonce: u64,
+        deadline_ledger: u32,
+        signature: Bytes,
+        public_key: Bytes,
+        splits: Vec<PaymentSplit>,
+    ) {
+        // 1. Deadline check: reject if current ledger sequence > deadline_ledger
+        let current_ledger_seq = env.ledger().sequence();
+        assert!(
+            current_ledger_seq <= deadline_ledger,
+            "deadline exceeded"
+        );
+
+        // 2. Verify Ed25519 signature of the sender
+        // Convert the Bytes to the fixed-size types expected by ed25519_verify
+        let pk_array: [u8; 32] = {
+            let pk_slice = public_key.as_slice();
+            assert!(pk_slice.len() == 32, "public key must be 32 bytes");
+            pk_slice.try_into().unwrap()
+        };
+        let sig_array: [u8; 64] = {
+            let sig_slice = signature.as_slice();
+            assert!(sig_slice.len() == 64, "signature must be 64 bytes");
+            sig_slice.try_into().unwrap()
+        };
+        let pk_n = soroban_sdk::BytesN::<32>::from_array(&env, &pk_array);
+        let sig_n = soroban_sdk::BytesN::<64>::from_array(&env, &sig_array);
+
+        let message = Self::build_authorization_message(&env, &sender, &token, nonce, deadline_ledger, &splits);
+        let is_valid = env.crypto().ed25519_verify(&pk_n, &message, &sig_n);
+        assert!(
+            is_valid,
+            "invalid signature"
+        );
+        let existing_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key)
+            .unwrap_or(0);
+        assert!(
+            existing_nonce != nonce,
+            "nonce replay detected"
+        );
+        env.storage()
+            .persistent()
+            .set(&nonce_key, &(&nonce + 1));
+
+        // 3. Execute the batch disbursement
+        Self::batch_disburse(env.clone(), sender, token, splits);
     }
 }
 

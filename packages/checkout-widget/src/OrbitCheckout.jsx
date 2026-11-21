@@ -41,6 +41,8 @@ export default function OrbitCheckout({
   customClasses = {},
   allowedOrigins = [],
   customFields = [],
+  termsUrl,
+  privacyUrl,
 }) {
   const walletChoices = useMemo(() => WALLET_MODULES.filter(([id]) => allowedWallets.includes(id)), [allowedWallets]);
   const [plan, setPlan] = useState(planData || null);
@@ -55,6 +57,7 @@ export default function OrbitCheckout({
   const [pending, setPending] = useState(null);
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
+  const [agreedToTerms, setAgreedToTerms] = useState(false);
 
   // Custom Form Fields & Validation
   const [formData, setFormData] = useState({});
@@ -325,7 +328,7 @@ export default function OrbitCheckout({
         networkPassphrase,
         preflight,
         onSubmitted: ({ stage, hash }) => {
-          localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
+          localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId, timestamp: Date.now() }));
           setPending({ stage, hash });
         },
         onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
@@ -523,10 +526,27 @@ export default function OrbitCheckout({
               <strong>{isDemo ? 'Demo address' : passkeyAdapter ? 'Passkey account' : 'Wallet'}:</strong> {address.slice(0, 8)}...{address.slice(-5)}
             </p>
             {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
+            {termsUrl || privacyUrl && (
+              <div style={{ marginTop: 12, padding: 12, background: 'var(--orbit-surface)', border: '1px solid var(--orbit-border)', borderRadius: 'var(--orbit-radius)', fontSize: 12 }}>
+                <p style={{ marginBottom: 8, color: 'var(--orbit-text)' }}>
+                  {termsUrl ? <span style={{ color: 'var(--orbit-link)' }} onClick={() => window.open(termsUrl, '_blank') }>Terms of Service</span> : ''}
+                  {privacyUrl ? <span style={{ marginLeft: 12, color: 'var(--orbit-link)' }} onClick={() => window.open(privacyUrl, '_blank') }>Privacy Policy</span> : ''}
+                </p>
+                <label style={{ display: 'block', marginTop: 8, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={agreedToTerms}
+                    onChange={(e) => setAgreedToTerms(e.target.checked)}
+                    style={{ transform: 'scale(1.2)', marginRight: 4 }}
+                  />
+                  I agree to the {"terms and conditions"} required to complete the subscription.
+                </label>
+              </div>
+            )}
             <button
               className={customClasses.button}
-              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1 }}
-              disabled={processing || isWrongNetwork}
+              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1, display: agreedToTerms || !termsUrl && !privacyUrl ? 1 : agreedToTerms ? 1 : 0.5 }}
+              disabled={processing || isWrongNetwork || (!agreedToTerms && (termsUrl || privacyUrl))}
               onClick={subscribe}
             >
               {processing
