@@ -302,9 +302,12 @@ async function unifiedBillingSummary(supabase, merchantId) {
     };
 }
 
-// express.json() `verify` hook: keep the exact bytes Stripe signed for this route only
+// express.json() `verify` hook: keep the exact bytes Stripe/Shopify signed for webhook routes
 function captureStripeRawBody(req, _res, buf) {
-    if (req.originalUrl?.split('?')[0] === '/webhooks/stripe') req.rawBody = Buffer.from(buf);
+    const path = req.originalUrl?.split('?')[0];
+    if (path === '/webhooks/stripe' || path?.startsWith('/api/integrations/')) {
+        req.rawBody = Buffer.from(buf);
+    }
 }
 
 function registerStripeBillingRoutes(app, getSupabase, authenticateMerchant) {

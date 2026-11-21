@@ -77,6 +77,21 @@ const typeDefs = parse(`
 
 const badInput = (message) => { throw new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } }); };
 const GRAPHQL_MAX_DEPTH = 8;
+const GRAPHQL_INTERNAL_MAX_DEPTH = 12;
+const GRAPHQL_MAX_COMPLEXITY = 1000;
+const GRAPHQL_INTERNAL_MAX_COMPLEXITY = 10000;
+
+function extractLimit(args) {
+    for (const arg of args || []) {
+        if (arg.name?.value === 'pagination') {
+            for (const field of arg.value?.fields || []) {
+                if (field.name?.value === 'limit') return Number(field.value?.value) || 1;
+            }
+        }
+    }
+    return 1;
+}
+
 const GRAPHQL_MAX_COMPLEXITY = 1000;
 const GRAPHQL_INTERNAL_MAX_COMPLEXITY = 10000;
 
@@ -85,6 +100,7 @@ function queryValidation(document, options = {}) {
         .map((d) => [d.name.value, d]));
     let totalCost = 0;
     const fieldWeights = { payments: 25, payrollSplits: 20, subscriptions: 15, plans: 10 };
+    const maxDepth = options.internalService ? GRAPHQL_INTERNAL_MAX_DEPTH : GRAPHQL_MAX_DEPTH;
     const maxDepth = options.internalService ? 12 : GRAPHQL_MAX_DEPTH;
     function walk(selectionSet, depth = 1, seen = new Set()) {
         if (!selectionSet) return;
@@ -106,6 +122,8 @@ function queryValidation(document, options = {}) {
             }
             const name = selection.name?.value || '';
             const argumentsCost = selection.arguments?.length ? 2 : 0;
+            const limit = extractLimit(selection.arguments);
+            totalCost += 1 + argumentsCost + ((fieldWeights[name] || 0) * limit);
             let limitMultiplier = 1;
             const paginationArg = selection.arguments?.find((a) => a.name?.value === 'pagination');
             if (paginationArg?.value?.fields) {
@@ -309,7 +327,7 @@ function registerGraphql(app, getSupabase, authenticateMerchant) {
                 const internalService = Boolean(configuredToken && internalToken === configuredToken);
                 return {
                     async didResolveOperation({ document }) {
-                        const cost = queryValidation(document);
+                        const cost = queryValidation(document, { internalService });
                         const maxCost = internalService ? GRAPHQL_INTERNAL_MAX_COMPLEXITY : GRAPHQL_MAX_COMPLEXITY;
                         if (cost > maxCost) {
                             throw new GraphQLError(`GraphQL query complexity ${cost} exceeds maximum budget ${maxCost}`, {
