@@ -163,7 +163,8 @@
       "settled": "Total Settled",
       "nextPull": "Next Pull",
       "status": "Vault Status",
-      "actions": "Actions"
+      "actions": "Actions",
+      "health": "Health"
     },
     "payroll": {
       "contractor": "Contractor",
@@ -292,5 +293,46 @@
     "confirmedOneTime": "Your one-time allowance is active on Stellar testnet.",
     "viewTx": "View transaction",
     "returnToMerchant": "Return to merchant"
+  },
+  "SubscriberHealth": {
+    "level": {
+      "good": "GOOD",
+      "warning": "WARNING",
+      "critical": "CRITICAL"
+    },
+    "notScored": "—",
+    "noRisk": "No renewal risk detected: balance, allowance and recent pulls look healthy.",
+    "factors": {
+      "insufficient_balance": "Insufficient USDC balance detected on-chain: the wallet cannot cover the next {amount} USDC pull.",
+      "low_balance": "Low USDC balance on-chain ({balance} USDC): enough for one more {amount} USDC pull at most.",
+      "allowance_exhausted": "Vault allowance is used up: Orbit cannot pull the next payment until the subscriber renews it.",
+      "allowance_low": "Vault allowance covers only {cycles, plural, =0 {no further cycles} one {# more cycle} other {# more cycles}}.",
+      "allowance_expired": "Vault allowance has expired: the last pull was refused on-chain.",
+      "pull_failures": "{count, plural, one {# recent pull failed} other {# recent pulls failed}}.",
+      "past_due": "Payment is past due and in dunning retries.",
+      "due_soon": "Renewal is due {hours, plural, =0 {now} one {in # hour} other {in # hours}}, leaving no time for the issue to resolve itself."
+    },
+    "card": {
+      "title": "{count, plural, one {# subscriber at risk of churn} other {# subscribers at risk of churn}}",
+      "subtitle": "Renewals likely to fail because of low balance, a used-up allowance or repeated failed pulls.",
+      "critical": "{count} critical",
+      "warning": "{count} warning",
+      "revenueLabel": "Revenue at risk next cycle",
+      "criticalRevenue": "{amount} USDC from critical subscribers",
+      "viewAtRisk": "View at-risk subscribers",
+      "showAll": "Show all subscribers",
+      "allHealthy": "{count, plural, one {The renewing subscriber looks healthy.} other {All # renewing subscribers look healthy.}}"
+    },
+    "reminder": {
+      "send": "Remind",
+      "sending": "Sending…",
+      "title": "Email the subscriber a link to top up their wallet or renew their allowance",
+      "sent": "Balance reminder sent to {recipient}.",
+      "demoRecipient": "the demo subscriber",
+      "failed": "Reminder not sent: {error}",
+      "noEmail": "No email on file: the subscriber did not leave one at checkout.",
+      "cooldown": "A reminder was already sent in the last 24 hours.",
+      "dismiss": "Dismiss"
+    }
   }
 }

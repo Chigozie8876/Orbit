@@ -81,6 +81,13 @@ export interface SubscriberRecord {
   nextDunningRetryAt?: string;
   recoveryLink?: string;
   lastFailure?: { code: string; message: string; occurred_at?: string; transaction_hash?: string };
+  /** ISO timestamp of the next pull, used for health scoring (#298). */
+  nextBillingAt?: string;
+  /** Latest on-chain balance/allowance check by the pre-billing monitor, in USDC (#298). */
+  liquidity?: { balance: number; allowance: number; checkedAt?: string };
+  /** Whether the subscriber left an email at checkout, so a reminder can be sent. */
+  hasContactEmail?: boolean;
+  lastBalanceReminderAt?: string;
 }
 
 export interface PaymentTimelineEvent {

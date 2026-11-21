@@ -27,6 +27,13 @@ export interface ApiSubscriptionItem {
   dunning_status?: string;
   next_dunning_retry_at?: string;
   last_failure?: { code: string; message: string; occurred_at?: string; transaction_hash?: string };
+  metadata?: {
+    customer_email?: string;
+    /** Raw token units, written by the backend pre-billing monitor (#298). */
+    liquidity?: { balance?: string | number; allowance?: string | number; checked_at?: string };
+    last_balance_reminder_at?: string;
+    [key: string]: unknown;
+  };
   plans?: {
     merchant_id?: string;
     name?: string;
@@ -146,7 +153,41 @@ export function mapApiSubscriberToRecord(
     retryCount: item.retry_count,
     nextDunningRetryAt: item.next_dunning_retry_at,
     lastFailure: item.last_failure,
+    nextBillingAt: isValidNextBilling ? nextBilling.toISOString() : undefined,
+    liquidity: mapLiquidity(item.metadata?.liquidity),
+    hasContactEmail: Boolean(item.metadata?.customer_email),
+    lastBalanceReminderAt: item.metadata?.last_balance_reminder_at,
   };
+}
+
+function mapLiquidity(raw: NonNullable<ApiSubscriptionItem["metadata"]>["liquidity"]) {
+  if (!raw || raw.balance === undefined || raw.allowance === undefined) return undefined;
+  return {
+    balance: fromRawUsdc(raw.balance),
+    allowance: fromRawUsdc(raw.allowance),
+    checkedAt: raw.checked_at,
+  };
+}
+
+export interface BalanceReminderResult {
+  sent: boolean;
+  recipient: string;
+  sent_at: string;
+  next_allowed_at: string;
+}
+
+/**
+ * Emails the subscriber a link to top up their wallet or renew their allowance
+ * (#298). The API enforces a per-subscription cooldown.
+ */
+export async function sendBalanceReminder(subscriptionId: string): Promise<BalanceReminderResult> {
+  const url = new URL(`/subscriptions/${subscriptionId}/balance-reminder`, ORBIT_API_URL);
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: merchantRequestHeaders(),
+    body: JSON.stringify({}),
+  });
+  return handleResponse<BalanceReminderResult>(res, "Failed to send balance reminder");
 }
 
 /**

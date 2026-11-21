@@ -27,8 +27,9 @@ const {
     replayWebhookEvents,
     replayDeadLetter,
     setDeliveryObserver,
+    verifyWebhookEndpoint,
 } = require('./webhooks');
-const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
+const { createDeliveryAlertObserver, createEndpointAlertNotifier, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -61,6 +62,10 @@ const {
     RateUnavailableError,
 } = require('./oracle');
 const {
+    createExchangeRateWorker,
+    buildRatePayload,
+} = require('./exchange-rates');
+const {
     createPayoutSplitDispatcher,
     createStellarSplitForwarder,
     registerPayoutSplitRoutes,
@@ -78,9 +83,11 @@ const { registerPrivacyRoutes } = require('./privacy');
 const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
 const { registerCohortRoutes } = require('./cohorts');
 const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerBalanceReminderRoutes } = require('./balance-reminders');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
-const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerRpcProxyRoute, createIpWindowLimiter: createRpcIpWindowLimiter } = require('./rpc-proxy');
+const { SimulationCache, getOrSimulate } = require('./simulation-cache');
 const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
 const { registerStorageHealthRoutes } = require('./storage-health');
 const { createDisputeAlertProcessor } = require('./dispute-alert-processor');
@@ -89,6 +96,8 @@ const { registerCredentialRoutes } = require('./credentials');
 const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
 const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
+const { createEmailDispatcher, sendSettlementReceipt } = require('./receipt-email');
+const { getSharedRpcPool } = require('./rpc-pool');
 const { registerDevFundingRoutes } = require('./dev-faucet');
 const {
     createRemoteMerchantSigner,
@@ -159,6 +168,20 @@ const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(app
 const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
 const getSupabase = () => getPrimarySupabase(app);
 
+// Stellar asset rate worker (#303). Created lazily so importing the Express app
+// never opens a Redis connection; `startServer()` starts the actual timer.
+let defaultExchangeRateWorker;
+const getExchangeRateWorker = () => {
+    if (app.locals.exchangeRateWorker) return app.locals.exchangeRateWorker;
+    if (!defaultExchangeRateWorker) {
+        defaultExchangeRateWorker = createExchangeRateWorker({
+            getFetch: () => app.locals.fetchImpl || globalThis.fetch,
+            getSupabase: () => getSupabase(),
+        });
+    }
+    return defaultExchangeRateWorker;
+};
+
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
 registerAnalyticsRoutes(app, getSupabase);
@@ -171,7 +194,15 @@ registerDevFundingRoutes(app, {
 });
 
 // Allows tests to inject a mock Soroban RPC server instead of hitting testnet
-const getSorobanServer = (rpcUrl) => app.locals.sorobanServer || new rpc.Server(rpcUrl);
+let defaultRpcPool;
+const getSorobanServer = (rpcUrl) => {
+    if (app.locals.sorobanServer) return app.locals.sorobanServer;
+    if (process.env.SOROBAN_RPC_SERVERS) {
+        defaultRpcPool ??= getSharedRpcPool();
+        return defaultRpcPool.proxy();
+    }
+    return new rpc.Server(rpcUrl);
+};
 
 // One relayer per process: its sequence cache and channel pool must be shared by all requests.
 // Tests inject their own through app.locals.relayer.
@@ -232,6 +263,18 @@ const relayRateLimit = createRateLimiter({
     message: "Relay rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters.relay = relayRateLimit;
+
+// Sponsorship requests come from unauthenticated checkout sessions, so they are
+// throttled per client IP rather than per merchant (#297)
+const sponsorRateLimit = createRateLimiter({
+    name: 'relay-sponsor',
+    store: rateLimitStore,
+    windowMs: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+    limit: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_MAX) || 5,
+    keyGenerator: (req) => getClientIp(req) || 'unknown',
+    message: "Sponsorship rate limit exceeded, please retry later",
+});
+app.locals.rateLimiters.relaySponsor = sponsorRateLimit;
 
 // How long to keep polling getTransaction() for a submitted hash before giving up
 const TX_POLL_TIMEOUT_MS = Number(process.env.TX_POLL_TIMEOUT_MS) || 30000;
@@ -519,6 +562,24 @@ app.get('/rates', async (req, res) => {
     }
 });
 
+// Structured Stellar asset rates (#303). Reads only the worker's cache so a
+// request never waits on an external oracle; stale/fallback data is labelled.
+app.get('/api/rates', async (req, res) => {
+    try {
+        const snapshot = await getExchangeRateWorker().readSnapshot();
+        const payload = buildRatePayload(snapshot);
+        res.set('Cache-Control', 'no-store');
+        res.set('X-Rate-Cache', payload.cache_status.toUpperCase());
+        res.set('X-Rate-Cache-Status', payload.cache_status);
+        res.set('X-Rate-Source', payload.rate_source || 'unknown');
+        res.set('X-Rate-Freshness', payload.fresh ? 'fresh' : 'stale');
+        res.status(200).json(payload);
+    } catch (err) {
+        console.error("Error fetching Stellar asset rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
@@ -653,10 +714,24 @@ const applyPullOutcome = async ({
                 if (payment) {
                     try {
                         const invoiceService = app.locals.invoiceService || createInvoiceService({ supabase });
-                        await invoiceService.createForSettledPayment({
+                        const receipt = await invoiceService.createForSettledPayment({
                             payment, merchant, plan: sub.plans, subscription: sub,
                             ledgerSequence: confirmation?.ledger ?? confirmation?.ledgerSequence ?? null,
                         });
+                        if (receipt?.invoice && receipt?.pdf) {
+                            const dispatcher = app.locals.receiptEmailDispatcher || createEmailDispatcher({
+                                fetchImpl: app.locals.fetchImpl || globalThis.fetch,
+                            });
+                            await sendSettlementReceipt({
+                                dispatcher,
+                                invoice: receipt.invoice,
+                                payment,
+                                merchant,
+                                plan: sub.plans,
+                                subscription: sub,
+                                pdf: receipt.pdf,
+                            });
+                        }
                     } catch (invoiceError) {
                         console.error('Invoice generation failed:', invoiceError);
                     }
@@ -990,6 +1065,7 @@ app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req
         if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
 
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
 
@@ -1118,26 +1194,74 @@ app.get('/relay/budget', authenticateMerchant, async (req, res) => {
 });
 
 /**
- * POST /relay/sponsor-transaction (#169)
- * Allows the checkout widget to submit atomic batch transactions sponsored by the relayer.
+ * POST /api/relayer/sponsor (#297)
+ * Wraps a subscriber-signed vault-creation transaction in a fee bump paid by the Orbit
+ * relayer, so a subscriber holding USDC but no XLM can onboard. The transaction must pass
+ * the sponsorship policy (sponsorship.js) and the relayer's fee caps before anything is
+ * signed or spent. Body: { signed_tx_xdr } (`tx_xdr` is accepted for the #169 widget).
+ *
+ * POST /relay/sponsor-transaction is kept as an alias for existing widgets. It used to
+ * fee-bump any transaction it was given; it now enforces the same policy.
  */
-app.post('/relay/sponsor-transaction', relayRateLimit, async (req, res) => {
-    try {
-        const { tx_xdr, network_passphrase } = req.body || {};
-        if (!tx_xdr) return res.status(400).json({ error: 'tx_xdr is required' });
-        const relayer = getRelayer();
-        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+const sponsorSchema = z.object({
+    signed_tx_xdr: z.string().min(1).optional(),
+    tx_xdr: z.string().min(1).optional(),
+    network_passphrase: z.string().optional(),
+}).refine((body) => body.signed_tx_xdr || body.tx_xdr, { message: 'signed_tx_xdr is required' });
 
-        const result = await relayer.sponsorTransaction({
-            txXdr: tx_xdr,
-            passphrase: network_passphrase || process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
-        });
-        return res.status(200).json(result);
-    } catch (err) {
-        console.error('Error sponsoring transaction:', err);
-        return res.status(500).json({ error: err.message || 'Fee sponsorship failed' });
+const findMerchantByWallet = async (walletAddress) => {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from('merchants')
+        .select('id')
+        .eq('wallet_address', walletAddress)
+        .maybeSingle();
+    if (error) throw error;
+    return data ?? null;
+};
+
+const SPONSOR_STATUS = { SUCCESS: 200, FAILED: 422, NOT_FOUND: 202 };
+
+const handleSponsorRequest = async (req, res) => {
+    const parsed = sponsorSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return res.status(400).json({ error: formatZodError(parsed.error), code: 'invalid_request' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+    const expectedPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+    if (parsed.data.network_passphrase && parsed.data.network_passphrase !== expectedPassphrase) {
+        return res.status(400).json({ error: 'This relayer only sponsors transactions on its own network', code: 'wrong_network' });
     }
-});
+
+    try {
+        const outcome = await relayer.sponsorUserTransaction({
+            txXdr: parsed.data.signed_tx_xdr || parsed.data.tx_xdr,
+            resolveMerchant: findMerchantByWallet,
+            confirm: (server, hash) => waitForTransaction(server, hash, {
+                timeoutMs: app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS,
+                intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
+            }),
+        });
+        const status = outcome.status === 'NOT_FOUND' ? 'PENDING' : outcome.status;
+        return res.status(SPONSOR_STATUS[outcome.status] ?? 502).json({
+            status,
+            tx_hash: outcome.txHash,
+            sponsored: true,
+            sponsor_address: relayer.sponsorAddress,
+            fee_charged_stroops: outcome.feeCharged,
+            max_fee_stroops: outcome.maxFee,
+            ...(outcome.status === 'FAILED' ? { error: 'The sponsored transaction failed on-chain', code: 'transaction_failed' } : {}),
+        });
+    } catch (err) {
+        if (isRelayerError(err)) return sendResult(res, relayerErrorResult(err));
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: 'Fee sponsorship failed', code: 'sponsorship_error' });
+    }
+};
+
+app.post('/api/relayer/sponsor', sponsorRateLimit, handleSponsorRequest);
+app.post('/relay/sponsor-transaction', sponsorRateLimit, handleSponsorRequest);
 
 // ==========================================
 // ROUTE 5: POST /subscriptions (Create Subscription after Handshake)
@@ -2045,6 +2169,21 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/verify', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+        const result = await verifyWebhookEndpoint(supabase, {
+            webhookId: req.params.id,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (result.statusCode) return res.status(result.statusCode).json({ error: result.error });
+        res.status(result.ok ? 200 : 502).json(result);
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
 app.post('/webhooks/:id/backfill', async (req, res) => {
     const parseResult = backfillWebhookSchema.safeParse(req.body || {});
     if (!parseResult.success) {
@@ -2088,6 +2227,7 @@ registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
 registerCohortRoutes(app, getSupabase, authenticateMerchant);
 registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerBalanceReminderRoutes(app, { getSupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
@@ -2097,6 +2237,7 @@ registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
 // Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
 registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
 setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
+setEndpointAlertNotifier(createEndpointAlertNotifier(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
@@ -2291,6 +2432,12 @@ function startServer() {
         console.warn("Oracle worker not started: Supabase client not initialized");
     }
 
+    // Stellar exchange-rate worker (#303): runs independently of request
+    // handling even when no database is configured, and degrades to cache or
+    // static baselines rather than failing startup.
+    app.locals.exchangeRateWorker = getExchangeRateWorker();
+    app.locals.exchangeRateWorker.start();
+
     const usageInterval = setInterval(() => {
         const buffer = getUsageBuffer(), supabase = getSupabase();
         if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
@@ -2301,6 +2448,17 @@ function startServer() {
         console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
     });
     app.locals.graphqlServer.attachWebsocket(httpServer);
+
+    let shuttingDown = false;
+    const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        app.locals.exchangeRateWorker?.stop();
+        app.locals.oracleWorker?.stop?.();
+        httpServer.close(() => process.exit(0));
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
 }
 
 // Pre-flight schema guard (#157): never serve against a database whose
@@ -2313,5 +2471,110 @@ if (require.main === module) {
             process.exit(1);
         });
 }
+
+
+// Simulation footprint cache shared across requests (#290).
+const sharedSimulationCache = new SimulationCache({
+    ttlLedgers: Number(process.env.SIM_CACHE_TTL_LEDGERS) || 10,
+});
+
+// POST /simulate/quote — unauthenticated read-only endpoint that returns a
+// cached simulation result for the given transaction XDR (#290). The result
+// is served from the in-process ledger-TTL cache when possible, saving
+// 400-800ms per duplicate pre-flight call.
+app.post('/simulate/quote', createRpcIpWindowLimiter({ limit: Number(process.env.RPC_PROXY_RATE_LIMIT_MAX) || 60 }), async (req, res) => {
+    const { transaction } = req.body || {};
+    if (!transaction || typeof transaction !== 'string') {
+        return res.status(400).json({ error: 'transaction (base64 XDR) is required' });
+    }
+    const proxy = app.locals.rpcProxy;
+    if (!proxy) return res.status(503).json({ error: 'RPC proxy not available' });
+    try {
+        const ledgerResp = await proxy.call({ method: 'getLatestLedger', params: [] });
+        const ledger = ledgerResp?.result?.sequence ?? 0;
+        const cacheKey = `simulateTransaction:${transaction}`;
+        const { value, source } = await getOrSimulate(sharedSimulationCache, cacheKey, {
+            ledger,
+            simulate: () => proxy.call({ method: 'simulateTransaction', params: [{ transaction }] }),
+        });
+        res.json({ ...value, cached: source === 'cache' });
+    } catch (err) {
+        res.status(err.statusCode || 502).json({ error: err.message });
+    }
+});
+
+// GET /payroll/streams — returns active streaming payroll streams for the merchant (#291).
+app.get('/payroll/streams', authenticateMerchant, async (req, res) => {
+    const supabase = getReadSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Database client not initialized' });
+    const { data, error } = await supabase
+        .from('payroll_streams')
+        .select('id, recipient_address, recipient_label, token_symbol, rate_per_second, start_time, end_time, withdrawn_amount')
+        .eq('merchant_id', req.merchant.id)
+        .eq('active', true)
+        .order('start_time', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const streams = (data || []).map((row) => ({
+        id: row.id,
+        recipientLabel: row.recipient_label || row.recipient_address,
+        tokenSymbol: row.token_symbol || 'USDC',
+        ratePerSecond: Number(row.rate_per_second) || 0,
+        startTime: new Date(row.start_time).getTime(),
+        endTime: new Date(row.end_time).getTime(),
+        withdrawnAmount: Number(row.withdrawn_amount) || 0,
+    }));
+    res.json({ streams });
+});
+
+// POST /payroll/streams/claim — submit a withdraw_from_stream transaction (#291).
+app.post('/payroll/streams/claim', authenticateMerchant, async (req, res) => {
+    const { stream_id, amount, sender_address } = req.body || {};
+    if (!stream_id || !amount || !sender_address) {
+        return res.status(400).json({ error: 'stream_id, amount, and sender_address are required' });
+    }
+    if (typeof amount !== 'number' || amount <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!StrKey.isValidEd25519PublicKey(sender_address)) {
+        return res.status(400).json({ error: 'sender_address must be a valid Stellar public key' });
+    }
+    const supabase = getPrimarySupabase();
+    const { data: streamRow, error: strErr } = await supabase
+        .from('payroll_streams')
+        .select('id, merchant_id')
+        .eq('id', stream_id)
+        .eq('merchant_id', req.merchant.id)
+        .maybeSingle();
+    if (strErr || !streamRow) return res.status(404).json({ error: 'Stream not found or access denied' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json({ error: 'Transaction relayer is not configured' });
+    const contractId = process.env.ORBIT_CONTRACT_ID;
+    if (!contractId) return res.status(503).json({ error: 'ORBIT_CONTRACT_ID is not configured' });
+    try {
+        const { rpc: RpcLib, Networks, TransactionBuilder, BASE_FEE, Contract, nativeToScVal } = require('@stellar/stellar-sdk');
+        const server = getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org');
+        const account = await server.getAccount(sender_address);
+        const rawAmount = BigInt(Math.round(amount * 10_000_000));
+        const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        })
+            .addOperation(
+                new Contract(contractId).call(
+                    'withdraw_from_stream',
+                    nativeToScVal(BigInt(stream_id), { type: 'u64' }),
+                    nativeToScVal(rawAmount, { type: 'i128' }),
+                )
+            )
+            .setTimeout(60)
+            .build();
+        const result = await relayer.relay(tx);
+        if (result.status !== 'SUCCESS') return res.status(502).json({ error: 'Transaction failed', result });
+        res.json({ tx_hash: result.hash, status: result.status });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 module.exports = app;

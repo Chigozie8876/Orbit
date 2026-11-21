@@ -5,6 +5,28 @@ const {
   dispatchSecureWebhook,
 } = require("./webhook-security");
 const { recordWebhookDelivery } = require("./health-metrics");
+const { WebhookCircuitBreaker, STATUS: ENDPOINT_STATUS } = require("./webhook-circuit-breaker");
+
+// Per-endpoint circuit breaker (#289). A paused endpoint's events go to the
+// durable dead-letter queue instead of being retried; verifying the endpoint
+// re-activates it and replays those dead letters.
+let endpointAlertNotifier = null;
+const setEndpointAlertNotifier = (notifier) => {
+  endpointAlertNotifier = typeof notifier === "function" ? notifier : null;
+};
+const endpointBreaker = new WebhookCircuitBreaker({
+  notify: async (alert) => {
+    if (!endpointAlertNotifier) {
+      console.warn(`Webhook endpoint paused: ${alert.url}`, alert);
+      return;
+    }
+    try {
+      await endpointAlertNotifier(alert);
+    } catch (err) {
+      console.error("Webhook endpoint alert failed:", err);
+    }
+  },
+});
 
 const createWebhookSchema = z.object({
   merchant_id: z.string().uuid("merchant_id must be a valid UUID"),
@@ -49,7 +71,7 @@ const verifyWebhookSignature = (signature, payloadString, secrets) => {
 // Timestamped signatures (#229)
 // ---------------------------------------------------------------------------
 //
-// X-Orbit-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+// X-Orbit-Signature: t=<unix seconds>,n=<uuid>,v1=<hex HMAC-SHA256(secret, "<t>.<nonce>.<raw body>")>
 //
 // Signing the timestamp together with the body lets receivers reject replays:
 // a captured request cannot be re-sent with a fresh timestamp without the secret.
@@ -60,18 +82,20 @@ const signWebhookPayload = (
   secret,
   payloadString,
   timestamp = Math.floor(Date.now() / 1000),
+  nonce = crypto.randomUUID(),
 ) => {
   const v1 = crypto
     .createHmac("sha256", secret)
-    .update(`${timestamp}.${payloadString}`)
+    .update(`${timestamp}.${nonce}.${payloadString}`)
     .digest("hex");
-  return { header: `t=${timestamp},v1=${v1}`, timestamp, v1 };
+  return { header: `t=${timestamp},n=${nonce},v1=${v1}`, timestamp, nonce, v1 };
 };
 
-// Returns { timestamp, signatures } or null for a malformed header
+// Returns { timestamp, nonce, signatures } or null for a malformed header
 const parseSignatureHeader = (header) => {
   if (typeof header !== "string") return null;
   let timestamp = null;
+  let nonce = null;
   const signatures = [];
   for (const part of header.split(",")) {
     const eq = part.indexOf("=");
@@ -79,14 +103,15 @@ const parseSignatureHeader = (header) => {
     const key = part.slice(0, eq).trim();
     const value = part.slice(eq + 1).trim();
     if (key === "t" && /^\d+$/.test(value)) timestamp = Number(value);
+    else if (key === "n" && /^[0-9a-f-]{36}$/i.test(value)) nonce = value;
     else if (key === "v1" && /^[0-9a-f]{64}$/i.test(value))
       signatures.push(value.toLowerCase());
   }
-  return timestamp !== null && signatures.length ? { timestamp, signatures } : null;
+  return timestamp !== null && nonce && signatures.length ? { timestamp, nonce, signatures } : null;
 };
 
 /**
- * Verifies a `t=...,v1=...` header against the raw body. Rejects timestamps
+ * Verifies a `t=...,n=...,v1=...` header against the raw body. Rejects timestamps
  * outside `toleranceSeconds` of now (replay protection). Any of `secrets` may
  * match, so deliveries signed just before a secret rotation still verify.
  */
@@ -102,7 +127,7 @@ const verifyTimestampedSignature = (
     return false;
   return [].concat(secrets).filter(Boolean).some((secret) => {
     const expected = Buffer.from(
-      signWebhookPayload(secret, payloadString, parsed.timestamp).v1,
+      signWebhookPayload(secret, payloadString, parsed.timestamp, parsed.nonce).v1,
       "hex",
     );
     return parsed.signatures.some((candidate) => {
@@ -113,14 +138,15 @@ const verifyTimestampedSignature = (
 };
 
 const signedDeliveryHeaders = ({ secret, payloadString, eventType, deliveryId, attempt, extra = {} }) => {
-  const { header, timestamp } = signWebhookPayload(secret, payloadString);
+  const { header, timestamp, nonce } = signWebhookPayload(secret, payloadString);
   return {
     "Content-Type": "application/json",
     "User-Agent": "Orbit-Webhooks/1.0",
     "X-Orbit-Signature": header,
     "X-Orbit-Event": eventType,
     "X-Orbit-Delivery": deliveryId,
-    "X-Orbit-Timestamp": new Date(timestamp * 1000).toISOString(),
+    "X-Orbit-Timestamp": String(timestamp),
+    "X-Orbit-Nonce": nonce,
     ...(attempt ? { "X-Orbit-Attempt": String(attempt) } : {}),
     ...extra,
   };
@@ -214,6 +240,18 @@ const scheduleWebhookRetry = ({
 
   schedule(async () => {
     try {
+      if (endpointBreaker.status(webhook.url) === ENDPOINT_STATUS.PAUSED) {
+        await supabase
+          .from("webhook_deliveries")
+          .update({ status: "dead_lettered", next_retry_at: null })
+          .eq("id", deliveryId);
+        await moveToDeadLetterQueue(supabase, {
+          deliveryId, webhook, merchantId, eventType, payload,
+          attemptCount: failedAttempt, responseStatus: null,
+          responseBody: "Endpoint paused by circuit breaker",
+        });
+        return;
+      }
       const headers = signedDeliveryHeaders({
         secret: webhook.signing_secret,
         payloadString,
@@ -223,6 +261,9 @@ const scheduleWebhookRetry = ({
       });
       const result = await postWebhook(fetchImpl, webhook.url, headers, payloadString);
       recordWebhookDelivery(result.ok ? "success" : "failed");
+      await endpointBreaker.recordAttempt(webhook.url, {
+        ok: result.ok, statusCode: result.responseStatus, body: result.responseBody,
+      });
       const exhausted = !result.ok && attempt >= config.maxAttempts;
       const nextDelay = result.ok || exhausted ? null : webhookRetryDelayMs(attempt, config);
 
@@ -404,6 +445,14 @@ const dispatchWebhookEvent = async (
     for (const wh of matchingWebhooks) {
       const webhook = { ...wh, signing_secret: wh.signing_secret || generateSigningSecret() };
       const deliveryId = crypto.randomUUID();
+      if (endpointBreaker.status(wh.url) === ENDPOINT_STATUS.PAUSED) {
+        await moveToDeadLetterQueue(supabase, {
+          deliveryId, webhook, merchantId, eventType, payload,
+          attemptCount: 0, responseStatus: null,
+          responseBody: "Endpoint paused by circuit breaker",
+        });
+        continue;
+      }
       const headers = signedDeliveryHeaders({
         secret: webhook.signing_secret,
         payloadString,
@@ -420,6 +469,7 @@ const dispatchWebhookEvent = async (
         payloadString,
       );
       recordWebhookDelivery(ok ? "success" : "failed");
+      await endpointBreaker.recordAttempt(wh.url, { ok, statusCode: responseStatus, body: responseBody });
       const willRetry = !ok && retryConfig.maxAttempts > 1;
       const status = ok ? "success" : willRetry ? "retrying" : "dead_lettered";
       const firstRetryDelay = willRetry ? webhookRetryDelayMs(1, retryConfig) : null;
@@ -804,7 +854,55 @@ const replayWebhookEvents = async (
   };
 };
 
+/**
+ * "Verify Endpoint" health ping (#289). Sends a signed `webhook.verify` request.
+ * On success the endpoint is re-activated and its paused dead letters are
+ * replayed. On failure it stays paused.
+ */
+const verifyWebhookEndpoint = async (supabase, { webhookId, fetchImpl = globalThis.fetch }) => {
+  if (!supabase || !webhookId) return { ok: false, statusCode: 400, error: "webhookId is required" };
+  const { data: webhook, error } = await supabase
+    .from("webhooks")
+    .select("*")
+    .eq("id", webhookId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!webhook) return { ok: false, statusCode: 404, error: "Webhook not found" };
+
+  const payloadString = JSON.stringify({ type: "webhook.verify", sent_at: new Date().toISOString() });
+  const headers = signedDeliveryHeaders({
+    secret: webhook.signing_secret || generateSigningSecret(),
+    payloadString,
+    eventType: "webhook.verify",
+    deliveryId: crypto.randomUUID(),
+    attempt: 1,
+  });
+  const result = await postWebhook(fetchImpl, webhook.url, headers, payloadString);
+
+  const outcome = await endpointBreaker.verify(webhook.url, async () => result);
+  if (!outcome.ok) {
+    return { ok: false, status: outcome.status, responseStatus: result.responseStatus, replayed: 0 };
+  }
+
+  const { data: letters, error: letterErr } = await supabase
+    .from("webhook_dead_letters")
+    .select("id")
+    .eq("webhook_id", webhook.id)
+    .is("replayed_at", null);
+  if (letterErr) throw letterErr;
+
+  let replayed = 0;
+  for (const letter of letters || []) {
+    const updated = await replayDeadLetter(supabase, letter.id, { fetchImpl });
+    if (updated?.replay_status === "success") replayed += 1;
+  }
+  return { ok: true, status: outcome.status, responseStatus: result.responseStatus, replayed };
+};
+
 module.exports = {
+  verifyWebhookEndpoint,
+  setEndpointAlertNotifier,
+  endpointBreaker,
   createWebhookSchema,
   updateWebhookSchema,
   backfillWebhookSchema,

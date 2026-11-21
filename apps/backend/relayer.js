@@ -12,6 +12,8 @@ const {
     Keypair, Account, Address, Operation, TransactionBuilder, Networks, BASE_FEE, xdr, hash,
     inspectAuthEntry, buildAuthorizationEntryPreimage, rpc,
 } = require('@stellar/stellar-sdk');
+const { RelayerError, isRelayerError } = require('./relayer-error');
+const { policyFromEnv, validateSponsoredTransaction } = require('./sponsorship');
 
 const DEFAULTS = {
     // Fee bump inclusion fee per operation, in stroops
@@ -24,23 +26,13 @@ const DEFAULTS = {
     queueTimeoutMs: 30000,
     // How long a prepared authorization stays signable (~5s per ledger)
     authValidityLedgers: 100,
+    // Highest inclusion fee per operation the relayer will offer when sponsoring a
+    // subscriber's transaction (#297), however congested the network is
+    maxBaseFeeStroops: 10_000,
     txTimeoutSeconds: 60,
     pendingLedgersBeforeBump: 2,
     maxFeeBumps: 2,
 };
-
-class RelayerError extends Error {
-    constructor(code, status, message, { retryAfter } = {}) {
-        super(message);
-        this.name = 'RelayerError';
-        this.code = code;
-        this.status = status;
-        this.retryAfter = retryAfter;
-    }
-}
-
-// Checked by name rather than instanceof, which fails if the module is loaded twice
-const isRelayerError = (err) => err?.name === 'RelayerError' && Number.isInteger(err.status);
 
 const ADDRESS_CREDENTIAL_TYPES = ['address', 'addressV2'];
 
@@ -192,6 +184,7 @@ const createRelayer = ({
     logger = console,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     feeEstimator = null,
+    sponsorshipPolicy = null,
     options = {},
 }) => {
     const opts = { ...DEFAULTS, ...options };
@@ -387,16 +380,83 @@ const createRelayer = ({
         };
     };
 
-    const sponsorTransaction = async ({ txXdr, passphrase = networkPassphrase }) => {
-        const innerTx = TransactionBuilder.fromXDR(txXdr, passphrase);
-        const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(opts.baseFee * 2), innerTx, passphrase);
+    /**
+     * Sponsors a subscriber-signed transaction (#297): checks it against the sponsorship
+     * policy, simulates it, wraps it in a fee bump paid by the sponsor within the fee caps,
+     * books the fee against the merchant's daily budget, submits it and waits for the
+     * result. Nothing is signed or spent until every check has passed.
+     *
+     * `resolveMerchant(walletAddress)` returns the registered merchant `{ id }` for the
+     * vault's recipient, or null; unknown recipients are refused.
+     */
+    const sponsorUserTransaction = async ({ txXdr, resolveMerchant, confirm }) => {
+        if (!sponsorshipPolicy) {
+            throw new RelayerError('sponsorship_unavailable', 503, 'Transaction sponsorship is not configured');
+        }
+        let innerTx;
+        try {
+            innerTx = TransactionBuilder.fromXDR(txXdr, networkPassphrase);
+        } catch {
+            throw new RelayerError('invalid_transaction', 400, 'signed_tx_xdr is not a valid transaction envelope');
+        }
+
+        const { merchant: merchantAddress } = validateSponsoredTransaction(innerTx, sponsorshipPolicy);
+        const merchant = await resolveMerchant(merchantAddress);
+        if (!merchant) {
+            throw new RelayerError('recipient_not_allowed', 403, `Vault recipient ${merchantAddress} is not a registered Orbit merchant`);
+        }
+
+        // A transaction that would fail still costs the sponsor its fee, so never submit one
+        const sim = await server.simulateTransaction(innerTx);
+        if (rpc.Api.isSimulationError(sim)) {
+            throw new RelayerError('simulation_failed', 422, `Transaction cannot be executed: ${sim.error}`);
+        }
+
+        // The caller never chooses the fee. The relayer offers its own estimate, clamped to
+        // the base fee cap, and refuses outright if the total would exceed the fee cap.
+        const estimate = feeEstimator ? await feeEstimator.estimate({ priority: 'high' }) : opts.baseFee;
+        const baseFee = Math.max(Number(BASE_FEE), Math.min(Number(estimate), opts.maxBaseFeeStroops));
+        const feeBump = TransactionBuilder.buildFeeBumpTransaction(sponsor, String(baseFee), innerTx, networkPassphrase);
+        const fee = Number(feeBump.fee);
+        if (fee > opts.maxFeeStroops) {
+            throw new RelayerError('fee_cap_exceeded', 422, `Sponsorship fee of ${fee} stroops exceeds the relayer cap of ${opts.maxFeeStroops}`);
+        }
+
+        const usageDate = await budget.reserve(merchant.id, fee);
+        if (!usageDate) {
+            throw new RelayerError('daily_budget_exceeded', 429, 'Daily gas sponsorship budget exceeded for this merchant', { retryAfter: 3600 });
+        }
+        const reservation = { usageDate, amount: fee };
+
         feeBump.sign(sponsor);
-        const submission = await server.sendTransaction(feeBump);
+        let response;
+        try {
+            response = await server.sendTransaction(feeBump);
+        } catch (err) {
+            // Unknown whether it was accepted: keep the booking at the maximum
+            throw new RelayerError('submission_failed', 502, `Could not submit the sponsored transaction: ${err.message}`);
+        }
+        if (response.status !== 'PENDING' && response.status !== 'DUPLICATE') {
+            await adjustBudget(merchant.id, reservation, -fee, 0);
+            if (response.status === 'TRY_AGAIN_LATER') {
+                throw new RelayerError('relayer_busy', 503, 'The network asked to retry later', { retryAfter: 5 });
+            }
+            const code = response.status === 'ERROR' ? resultCode(response.errorResult) : null;
+            throw new RelayerError('submission_rejected', 502, `Sponsored transaction rejected: ${code ?? response.status}`);
+        }
+
+        const confirmation = await confirm(server, response.hash);
+        const charged = confirmation.resultXdr?.feeCharged;
+        const feeCharged = charged === undefined || charged === null ? null : Number(charged);
+        await adjustBudget(merchant.id, reservation, feeCharged === null ? 0 : feeCharged - fee, 1);
+        logger.info?.(`Sponsored transaction ${response.hash} for merchant ${merchant.id}: ${confirmation.status}, fee ${feeCharged ?? fee} stroops`);
+
         return {
-            txHash: submission.hash,
-            status: submission.status,
-            sponsored: true,
-            sponsorAddress: sponsor.publicKey(),
+            status: confirmation.status,
+            txHash: response.hash,
+            feeCharged,
+            maxFee: fee,
+            merchantId: merchant.id,
         };
     };
 
@@ -409,7 +469,7 @@ const createRelayer = ({
         verifyPullAuthorization,
         relayPull,
         budgetStatus,
-        sponsorTransaction,
+        sponsorUserTransaction,
     };
 };
 
@@ -424,17 +484,26 @@ const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, env = process
         maxAttempts: envNumber('RELAYER_MAX_ATTEMPTS'),
         queueTimeoutMs: envNumber('RELAYER_QUEUE_TIMEOUT_MS'),
         authValidityLedgers: envNumber('RELAYER_AUTH_VALIDITY_LEDGERS'),
+        maxBaseFeeStroops: envNumber('RELAYER_MAX_BASE_FEE_STROOPS'),
     }).filter(([, value]) => value !== undefined));
 
     const sponsor = Keypair.fromSecret(env.RELAYER_SECRET_KEY);
     const channelSecrets = (env.RELAYER_CHANNEL_SECRET_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const channels = channelSecrets.length > 0 ? channelSecrets.map((s) => Keypair.fromSecret(s)) : [sponsor];
+    const networkPassphrase = env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
 
     return createRelayer({
         server,
         sponsor,
-        channels: channelSecrets.length > 0 ? channelSecrets.map((s) => Keypair.fromSecret(s)) : [sponsor],
+        channels,
         contractId: env.ORBIT_CONTRACT_ID,
-        networkPassphrase: env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        networkPassphrase,
+        // Every relayer account is excluded as a source or signer of sponsored transactions
+        sponsorshipPolicy: policyFromEnv({
+            env,
+            relayerAccounts: [sponsor, ...channels].map((kp) => kp.publicKey()),
+            networkPassphrase,
+        }),
         budget: createSupabaseFeeBudget(getSupabase, {
             dailyLimitStroops: envNumber('RELAYER_DAILY_FEE_LIMIT_STROOPS') ?? DEFAULTS.dailyFeeLimitStroops,
         }),
