@@ -27,8 +27,9 @@ const {
     replayWebhookEvents,
     replayDeadLetter,
     setDeliveryObserver,
+    verifyWebhookEndpoint,
 } = require('./webhooks');
-const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
+const { createDeliveryAlertObserver, createEndpointAlertNotifier, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -61,6 +62,10 @@ const {
     RateUnavailableError,
 } = require('./oracle');
 const {
+    createExchangeRateWorker,
+    buildRatePayload,
+} = require('./exchange-rates');
+const {
     createPayoutSplitDispatcher,
     createStellarSplitForwarder,
     registerPayoutSplitRoutes,
@@ -78,9 +83,11 @@ const { registerPrivacyRoutes } = require('./privacy');
 const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
 const { registerCohortRoutes } = require('./cohorts');
 const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerBalanceReminderRoutes } = require('./balance-reminders');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
-const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerRpcProxyRoute, createIpWindowLimiter: createRpcIpWindowLimiter } = require('./rpc-proxy');
+const { SimulationCache, getOrSimulate } = require('./simulation-cache');
 const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
@@ -90,6 +97,12 @@ const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 const { createEmailDispatcher, sendSettlementReceipt } = require('./receipt-email');
 const { getSharedRpcPool } = require('./rpc-pool');
 const { registerDevFundingRoutes } = require('./dev-faucet');
+const {
+    createRemoteMerchantSigner,
+    createSupabaseStore: createRecurringPullStore,
+    createRecurringPullWorker,
+    startRecurringPullWorker,
+} = require('./recurring-pulls');
 
 const app = express();
 const feeEstimator = createFeeEstimator({ horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org' });
@@ -152,6 +165,20 @@ const dbManager = getDatabaseManager();
 const getPrimarySupabase = (appInstance = app) => dbManager.getPrimaryClient(appInstance);
 const getReadSupabase = (appInstance = app) => dbManager.getReadClient(appInstance);
 const getSupabase = () => getPrimarySupabase(app);
+
+// Stellar asset rate worker (#303). Created lazily so importing the Express app
+// never opens a Redis connection; `startServer()` starts the actual timer.
+let defaultExchangeRateWorker;
+const getExchangeRateWorker = () => {
+    if (app.locals.exchangeRateWorker) return app.locals.exchangeRateWorker;
+    if (!defaultExchangeRateWorker) {
+        defaultExchangeRateWorker = createExchangeRateWorker({
+            getFetch: () => app.locals.fetchImpl || globalThis.fetch,
+            getSupabase: () => getSupabase(),
+        });
+    }
+    return defaultExchangeRateWorker;
+};
 
 // Merchant routes: authenticate the API key, then apply its rate limit
 const authenticateMerchant = [requireApiKey(getSupabase), reputation.markAuthenticated, apiKeyRateLimit];
@@ -234,6 +261,18 @@ const relayRateLimit = createRateLimiter({
     message: "Relay rate limit exceeded, please retry later",
 });
 app.locals.rateLimiters.relay = relayRateLimit;
+
+// Sponsorship requests come from unauthenticated checkout sessions, so they are
+// throttled per client IP rather than per merchant (#297)
+const sponsorRateLimit = createRateLimiter({
+    name: 'relay-sponsor',
+    store: rateLimitStore,
+    windowMs: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_WINDOW_MS) || 60 * 1000,
+    limit: Number(process.env.RELAYER_SPONSOR_RATE_LIMIT_MAX) || 5,
+    keyGenerator: (req) => getClientIp(req) || 'unknown',
+    message: "Sponsorship rate limit exceeded, please retry later",
+});
+app.locals.rateLimiters.relaySponsor = sponsorRateLimit;
 
 // How long to keep polling getTransaction() for a submitted hash before giving up
 const TX_POLL_TIMEOUT_MS = Number(process.env.TX_POLL_TIMEOUT_MS) || 30000;
@@ -521,6 +560,24 @@ app.get('/rates', async (req, res) => {
     }
 });
 
+// Structured Stellar asset rates (#303). Reads only the worker's cache so a
+// request never waits on an external oracle; stale/fallback data is labelled.
+app.get('/api/rates', async (req, res) => {
+    try {
+        const snapshot = await getExchangeRateWorker().readSnapshot();
+        const payload = buildRatePayload(snapshot);
+        res.set('Cache-Control', 'no-store');
+        res.set('X-Rate-Cache', payload.cache_status.toUpperCase());
+        res.set('X-Rate-Cache-Status', payload.cache_status);
+        res.set('X-Rate-Source', payload.rate_source || 'unknown');
+        res.set('X-Rate-Freshness', payload.fresh ? 'fresh' : 'stale');
+        res.status(200).json(payload);
+    } catch (err) {
+        console.error("Error fetching Stellar asset rates:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ==========================================
 // ROUTE 4: POST /trigger-pull (The Blockchain Bridge)
 // ==========================================
@@ -560,25 +617,33 @@ const applyPullOutcome = async ({
     server = null,
     signedTx = null,
     extraBody = {},
+    subscriptionAlreadySettled = false,
+    settledAt = null,
+    nextBillingDate = null,
     // Seconds spent waiting for Soroban confirmation, for orbit_pull_duration_seconds (#230)
     confirmationSeconds = null,
 }) => {
     recordPullOutcome(status, confirmationSeconds);
     if (status === "SUCCESS") {
-        const pullTime = new Date();
-        const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
+        const pullTime = settledAt || new Date();
+        const nextBilling = nextBillingDate
+            ? new Date(nextBillingDate)
+            : new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
 
-        await supabase
-            .from('subscriptions')
-            .update({
-                next_billing_date: nextBilling.toISOString(),
-                status: 'active',
-                retry_count: 0,
-                dunning_status: null,
-                next_dunning_retry_at: null,
-                last_failure: null,
-            })
-            .eq('id', subscription_id);
+        if (!subscriptionAlreadySettled) {
+            const { error: subscriptionUpdateError } = await supabase
+                .from('subscriptions')
+                .update({
+                    next_billing_date: nextBilling.toISOString(),
+                    status: 'active',
+                    retry_count: 0,
+                    dunning_status: null,
+                    next_dunning_retry_at: null,
+                    last_failure: null,
+                })
+                .eq('id', subscription_id);
+            if (subscriptionUpdateError) throw subscriptionUpdateError;
+        }
 
         await writeAuditLog(supabase, {
             merchantId: sub.plans.merchant_id,
@@ -998,3 +1063,1511 @@ app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req
         if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
 
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
+
+        let prepared;
+        try {
+            prepared = await relayer.preparePullAuthorization({
+                user: sub.customer_wallet_address,
+                merchant: merchant.wallet_address,
+            });
+        } catch (err) {
+            if (isRelayerError(err)) return sendResult(res, relayerErrorResult(err));
+            throw err;
+        }
+
+        res.status(200).json({
+            auth_entry_xdr: prepared.authEntryXdr,
+            valid_until_ledger: prepared.validUntilLedger,
+            network_passphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+            merchant_address: merchant.wallet_address,
+            sponsor_address: relayer.sponsorAddress,
+            subscription_id,
+        });
+    } catch (err) {
+        console.error("Error preparing sponsored pull:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/relay/submit-pull', authenticateMerchant, relayRateLimit, async (req, res) => {
+    const parseResult = relaySubmitPullSchema.safeParse(req.body);
+    if (!parseResult.success) return res.status(400).json({ error: formatZodError(parseResult.error) });
+
+    try {
+        const { subscription_id, signed_auth_entry_xdr } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        const context = await loadPullContext(supabase, subscription_id, req.merchant);
+        if (context.error) return res.status(context.status).json({ error: context.error });
+        const { sub, merchant } = context;
+
+        const pollTimeoutMs = app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS;
+        const pullParties = { user: sub.customer_wallet_address, merchant: merchant.wallet_address };
+
+        const result = await executeIdempotently({
+            supabase,
+            req,
+            label: "relaying pull",
+            resolveMerchant: () => ({ merchantId: sub.plans.merchant_id }),
+        }, async () => {
+            let entry;
+            try {
+                entry = await relayer.verifyPullAuthorization({ entryXdr: signed_auth_entry_xdr, ...pullParties });
+            } catch (err) {
+                if (isRelayerError(err)) return relayerErrorResult(err);
+                throw err;
+            }
+
+            return withBillingLock({
+                supabase,
+                subscriptionId: subscription_id,
+                ttlSeconds: relayLockTtlSeconds(pollTimeoutMs),
+            }, async () => {
+                let outcome;
+                // A relayed pull may be fee-bumped and confirmed more than once; time all of it
+                let confirmationNs = 0n;
+                try {
+                    outcome = await relayer.relayPull({
+                        merchantId: merchant.id,
+                        entry,
+                        ...pullParties,
+                        confirm: async (server, hash) => {
+                            const started = process.hrtime.bigint();
+                            try {
+                                return await waitForTransaction(server, hash, {
+                                    timeoutMs: pollTimeoutMs,
+                                    intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
+                                });
+                            } finally {
+                                confirmationNs += process.hrtime.bigint() - started;
+                            }
+                        },
+                    });
+                } catch (err) {
+                    if (isRelayerError(err)) return relayerErrorResult(err);
+                    throw err;
+                }
+
+                return applyPullOutcome({
+                    supabase, req, sub, merchant, subscription_id,
+                    txHash: outcome.txHash,
+                    status: outcome.status,
+                    confirmationSeconds: Number(confirmationNs) / 1e9,
+                    extraBody: {
+                        sponsored: true,
+                        sponsor_address: relayer.sponsorAddress,
+                        fee_charged_stroops: outcome.feeCharged,
+                        attempts: outcome.attempts,
+                    },
+                });
+            });
+        });
+        if (result.status >= 500 && !result.body?.txHash) await recordPullFailure(supabase, subscription_id, result.body?.error || 'Pull submission failed');
+        sendResult(res, result);
+    } catch (err) {
+        console.error("Error relaying pull:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/relay/budget', authenticateMerchant, async (req, res) => {
+    try {
+        if (!getSupabase()) return res.status(500).json({ error: "Supabase client not initialized" });
+        const relayer = getRelayer();
+        if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+        res.status(200).json({ budget: await relayer.budgetStatus(req.merchant.id) });
+    } catch (err) {
+        console.error("Error fetching relayer budget:", err);
+        console.error("Error submitting pull:", err);
+        if (ownedSubscriptionId) await recordPullFailure(getSupabase(), ownedSubscriptionId, err.message).catch(console.error);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /api/relayer/sponsor (#297)
+ * Wraps a subscriber-signed vault-creation transaction in a fee bump paid by the Orbit
+ * relayer, so a subscriber holding USDC but no XLM can onboard. The transaction must pass
+ * the sponsorship policy (sponsorship.js) and the relayer's fee caps before anything is
+ * signed or spent. Body: { signed_tx_xdr } (`tx_xdr` is accepted for the #169 widget).
+ *
+ * POST /relay/sponsor-transaction is kept as an alias for existing widgets. It used to
+ * fee-bump any transaction it was given; it now enforces the same policy.
+ */
+const sponsorSchema = z.object({
+    signed_tx_xdr: z.string().min(1).optional(),
+    tx_xdr: z.string().min(1).optional(),
+    network_passphrase: z.string().optional(),
+}).refine((body) => body.signed_tx_xdr || body.tx_xdr, { message: 'signed_tx_xdr is required' });
+
+const findMerchantByWallet = async (walletAddress) => {
+    const supabase = getSupabase();
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from('merchants')
+        .select('id')
+        .eq('wallet_address', walletAddress)
+        .maybeSingle();
+    if (error) throw error;
+    return data ?? null;
+};
+
+const SPONSOR_STATUS = { SUCCESS: 200, FAILED: 422, NOT_FOUND: 202 };
+
+const handleSponsorRequest = async (req, res) => {
+    const parsed = sponsorSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return res.status(400).json({ error: formatZodError(parsed.error), code: 'invalid_request' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
+
+    const expectedPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+    if (parsed.data.network_passphrase && parsed.data.network_passphrase !== expectedPassphrase) {
+        return res.status(400).json({ error: 'This relayer only sponsors transactions on its own network', code: 'wrong_network' });
+    }
+
+    try {
+        const outcome = await relayer.sponsorUserTransaction({
+            txXdr: parsed.data.signed_tx_xdr || parsed.data.tx_xdr,
+            resolveMerchant: findMerchantByWallet,
+            confirm: (server, hash) => waitForTransaction(server, hash, {
+                timeoutMs: app.locals.txPollTimeoutMs ?? TX_POLL_TIMEOUT_MS,
+                intervalMs: app.locals.txPollIntervalMs ?? TX_POLL_INTERVAL_MS,
+            }),
+        });
+        const status = outcome.status === 'NOT_FOUND' ? 'PENDING' : outcome.status;
+        return res.status(SPONSOR_STATUS[outcome.status] ?? 502).json({
+            status,
+            tx_hash: outcome.txHash,
+            sponsored: true,
+            sponsor_address: relayer.sponsorAddress,
+            fee_charged_stroops: outcome.feeCharged,
+            max_fee_stroops: outcome.maxFee,
+            ...(outcome.status === 'FAILED' ? { error: 'The sponsored transaction failed on-chain', code: 'transaction_failed' } : {}),
+        });
+    } catch (err) {
+        if (isRelayerError(err)) return sendResult(res, relayerErrorResult(err));
+        console.error('Error sponsoring transaction:', err);
+        return res.status(500).json({ error: 'Fee sponsorship failed', code: 'sponsorship_error' });
+    }
+};
+
+app.post('/api/relayer/sponsor', sponsorRateLimit, handleSponsorRequest);
+app.post('/relay/sponsor-transaction', sponsorRateLimit, handleSponsorRequest);
+
+// ==========================================
+// ROUTE 5: POST /subscriptions (Create Subscription after Handshake)
+// ==========================================
+app.post('/subscriptions', async (req, res) => {
+    const parseResult = createSubscriptionSchema.safeParse(req.body);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    const { plan_id, customer_wallet_address, metadata, coupon_code } = parseResult.data;
+    const supabase = getPrimarySupabase();
+    if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+    if (!dbManager.isPrimaryHealthy()) {
+        return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+    }
+
+    const result = await executeIdempotently({
+        supabase,
+        req,
+        label: "creating subscription",
+        // Idempotency keys are scoped to the merchant that owns the plan
+        resolveMerchant: async () => {
+            const { data: plan, error } = await supabase
+                .from('plans')
+                .select('merchant_id')
+                .eq('id', plan_id)
+                .single();
+            if (isNoRowsError(error) || !plan) return { status: 404, body: { error: "Plan not found" } };
+            if (error) throw error;
+            return { merchantId: plan.merchant_id };
+        },
+    }, async () => {
+        const nextBillingDate = new Date().toISOString();
+
+        // Look up the plan so fiat plans can capture the oracle rate as their
+        // slippage quote. Non-fatal: the insert below still verifies the plan
+        // through its foreign key.
+        let planRow = null;
+        try {
+            const { data: planData, error: planLookupError } = await supabase
+                .from('plans')
+                .select('merchant_id, currency, price_amount, usdc_amount')
+                .eq('id', plan_id);
+            if (planLookupError) throw planLookupError;
+            planRow = Array.isArray(planData) ? planData[0] : planData || null;
+        } catch (err) {
+            console.error("Error loading plan for subscription:", err.message);
+        }
+
+        const insertPayload = {
+            plan_id,
+            customer_wallet_address,
+            next_billing_date: nextBillingDate,
+            metadata: metadata || {},
+        };
+
+        // Fiat plans: quote the fiat->USDC rate now. The pull flow later
+        // rejects settlements whose live rate moves more than 2% from it.
+        if (isFiatCurrency(planRow?.currency)) {
+            try {
+                const quote = await quoteUsdcAmount({
+                    supabase,
+                    plan: planRow,
+                    fetchImpl: app.locals.fetchImpl,
+                    allowNetwork: false,
+                    enforceSlippage: false,
+                });
+                insertPayload.quoted_rate = quote.rate;
+            } catch (err) {
+                // Cold rate cache: subscribe without a quote; the first pull stores one
+                console.error("Unable to quote subscription exchange rate:", err.message);
+            }
+        }
+
+        // A SQL function locks the coupon and atomically creates the
+        // subscription and increments redemptions_count; no read-then-write race.
+        let data, error;
+        if (coupon_code) {
+            const redeemed = await supabase.rpc('redeem_coupon_subscription', {
+                p_plan_id: plan_id,
+                p_customer_wallet_address: customer_wallet_address,
+                p_metadata: metadata || {},
+                p_code: normalizeCode(coupon_code),
+                p_quoted_rate: insertPayload.quoted_rate ?? null,
+            });
+            data = Array.isArray(redeemed.data) ? redeemed.data[0] : redeemed.data;
+            error = redeemed.error;
+            if (error?.code === 'P7501') return { status: 422, body: { error: 'Coupon invalid or incompatible with plan' } };
+            if (error?.code === 'P7502') return { status: 409, body: { error: 'Coupon redemption limit reached' } };
+            if (error?.code === 'P7503') return { status: 404, body: { error: 'Plan not found' } };
+        } else {
+            ({ data, error } = await supabase.from('subscriptions')
+                .insert([insertPayload]).select().single());
+        }
+
+        if (isForeignKeyError(error)) return { status: 404, body: { error: "Plan not found" } };
+        if (isUniqueViolation(error)) {
+            return { status: 409, body: { error: "This wallet is already subscribed to this plan" } };
+        }
+        if (error) throw error;
+
+        // Fetch merchant id from plan to scope audit & webhook
+        const { data: planData } = await supabase
+            .from('plans')
+            .select('merchant_id')
+            .eq('id', plan_id)
+            .single();
+
+        const merchantId = planData?.merchant_id;
+
+        await writeAuditLog(supabase, {
+            merchantId,
+            actorAddress: getActorAddress(req, customer_wallet_address),
+            action: 'subscription.create',
+            resourceType: 'subscription',
+            resourceId: data.id,
+            ipAddress: getClientIp(req),
+            changesBefore: null,
+            changesAfter: data,
+        });
+
+        if (merchantId) {
+            await dispatchWebhookEvent(supabase, {
+                merchantId,
+                eventType: 'subscription.created',
+                payload: {
+                    event: 'subscription.created',
+                    subscription_id: data.id,
+                    customer_wallet_address,
+                    plan_id,
+                    next_billing_date: nextBillingDate,
+                },
+                fetchImpl: app.locals.fetchImpl,
+            });
+        }
+
+        if (merchantId) {
+            app.locals.paymentEventBus?.publish('subscriptionCreated', {
+                merchantId, subscriptionId: data.id,
+                id: data.id, status: data.status || 'active',
+            }).catch((error) => console.error('Subscription stream publish failed:', error));
+        }
+        return { status: 201, body: { message: "Subscription created", subscription: data } };
+    });
+    sendResult(res, result);
+});
+
+// ==========================================
+// ROUTE 6: API key management (authenticated with an existing key)
+// ==========================================
+// The first key for a merchant is issued out of band with `npm run create-api-key`.
+
+const API_KEY_COLUMNS = 'id, name, key_prefix, environment, created_at, last_used_at, revoked_at';
+
+// Not wrapped in executeIdempotently: that would persist the one-time secret in idempotency_keys
+app.post('/api-keys', authenticateMerchant, async (req, res) => {
+    const parseResult = createApiKeySchema.safeParse(req.body);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    const { name, environment } = parseResult.data;
+    // A test key must not be able to escalate itself into live credentials
+    if (environment === 'live' && req.apiKey.environment !== 'live') {
+        return res.status(403).json({ error: "Live API keys can only be created with a live API key" });
+    }
+
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { apiKey, secret, error } = await issueApiKey(supabase, { merchantId: req.merchant.id, name, environment });
+        if (error) throw error;
+
+        await writeAuditLog(supabase, {
+            merchantId: req.merchant.id,
+            actorAddress: getActorAddress(req, null),
+            action: 'api_key.create',
+            resourceType: 'api_key',
+            resourceId: apiKey.id,
+            ipAddress: getClientIp(req),
+            changesBefore: null,
+            changesAfter: { name, environment, key_prefix: apiKey.key_prefix },
+        });
+
+        res.set('Cache-Control', 'no-store');
+        res.status(201).json({
+            message: "API key created. Store the secret now; it will not be shown again.",
+            api_key: apiKey,
+            secret,
+        });
+    } catch (err) {
+        console.error("Error creating API key:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api-keys', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data, error } = await supabase
+            .from('api_keys')
+            .select(API_KEY_COLUMNS)
+            .eq('merchant_id', req.merchant.id)
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+
+        res.status(200).json({ api_keys: data });
+    } catch (err) {
+        console.error("Error listing API keys:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api-keys/:id', authenticateMerchant, async (req, res) => {
+    const parseResult = apiKeyParamsSchema.safeParse(req.params);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        // Scoped by merchant_id so one merchant can never revoke another's key
+        const { data, error } = await supabase
+            .from('api_keys')
+            .update({ revoked_at: new Date().toISOString() })
+            .eq('id', parseResult.data.id)
+            .eq('merchant_id', req.merchant.id)
+            .is('revoked_at', null)
+            .select(API_KEY_COLUMNS)
+            .maybeSingle();
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: "API key not found or already revoked" });
+
+        await writeAuditLog(supabase, {
+            merchantId: req.merchant.id,
+            actorAddress: getActorAddress(req, null),
+            action: 'api_key.revoke',
+            resourceType: 'api_key',
+            resourceId: parseResult.data.id,
+            ipAddress: getClientIp(req),
+            changesBefore: data,
+            changesAfter: { revoked_at: data.revoked_at },
+        });
+
+        res.status(200).json({ message: "API key revoked", api_key: data });
+    } catch (err) {
+        console.error("Error revoking API key:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// ROUTE 7: GET /audit-logs (Compliance & Forensic Audit Trail)
+// ==========================================
+app.get('/audit-logs', async (req, res) => {
+    const parseResult = getAuditLogsQuerySchema.safeParse(req.query);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { merchant_id, action, resource_type, start_date, end_date, limit, offset } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        let query = supabase
+            .from('audit_logs')
+            .select('*', { count: 'exact' })
+            .eq('merchant_id', merchant_id);
+
+        if (action) query = query.eq('action', action);
+        if (resource_type) query = query.eq('resource_type', resource_type);
+        if (start_date) query = query.gte('created_at', start_date);
+        if (end_date) query = query.lte('created_at', end_date);
+
+        query = query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+
+        const { data, count, error } = await query;
+        if (error) throw error;
+
+        res.status(200).json({
+            audit_logs: data || [],
+            total: count ?? (data?.length || 0),
+            limit,
+            offset,
+        });
+    } catch (err) {
+        console.error("Error fetching audit logs:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// ROUTE 8: DUNNING MANAGEMENT & RECOVERY
+// ==========================================
+app.post('/dunning/process', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+        const merchant_id = req.body?.merchant_id;
+        // Use the merchant's saved dunning workflow when one exists (#190)
+        const workflow = await loadDunningWorkflow(supabase, merchant_id);
+        const result = await processDunningRetries(supabase, {
+            merchantId: merchant_id,
+            fetchImpl: app.locals.fetchImpl,
+            workflowSteps: workflow?.steps || null,
+        });
+        res.status(200).json(result);
+    } catch (err) {
+        console.error("Error processing dunning retries:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/subscriptions/:id/recovery-link', authenticateMerchant, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: sub, error } = await supabase
+            .from('subscriptions')
+            .select('*, plans(*)')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
+        if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
+
+        if (sub.plans?.merchant_id !== req.merchant.id) return res.status(404).json({ error: 'Subscription not found' });
+
+        const recovery = generateRecoveryLink(id, { planId: sub.plan_id });
+        res.status(200).json(recovery);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// ROUTE 8: CUSTOMER MANAGEMENT ACTIONS
+// ==========================================
+app.post('/subscriptions/:id/cancel', authenticateMerchant, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: sub, error } = await supabase
+            .from('subscriptions')
+            .select('*, plans(*)')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
+        if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
+
+        const changesBefore = { status: sub.status };
+        const changesAfter = { status: 'cancelled', next_dunning_retry_at: null };
+
+        const { data: updated, error: updateErr } = await supabase
+            .from('subscriptions')
+            .update(changesAfter)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (updateErr) throw updateErr;
+
+        // Cancelled subscribers lose their verifiable credentials immediately (#132).
+        // Verification also re-checks subscription status, so a failure here only
+        // delays the revocation record, never access.
+        try {
+            await credentialService.revocations.revokeSubscription(supabase, id, 'subscription_cancelled');
+        } catch (revokeErr) {
+            console.error("Error revoking credentials for cancelled subscription:", id, revokeErr);
+        }
+
+        const merchantId = sub.plans?.merchant_id;
+        await writeAuditLog(supabase, {
+            merchantId,
+            actorAddress: getActorAddress(req, sub.customer_wallet_address),
+            action: 'subscription.cancel',
+            resourceType: 'subscription',
+            resourceId: id,
+            ipAddress: getClientIp(req),
+            changesBefore,
+            changesAfter,
+        });
+
+        if (merchantId) {
+            await dispatchWebhookEvent(supabase, {
+                merchantId,
+                eventType: 'subscription.cancelled',
+                payload: {
+                    event: 'subscription.cancelled',
+                    subscription_id: id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    reason: req.body?.reason || 'merchant_requested',
+                },
+                fetchImpl: app.locals.fetchImpl,
+            });
+        }
+
+        if (merchantId) {
+            app.locals.paymentEventBus?.publish('vaultCancelled', {
+                merchantId, subscriptionId: id, id, status: 'cancelled',
+            }).catch((error) => console.error('Subscription cancellation stream failed:', error));
+        }
+        res.status(200).json({ message: "Subscription cancelled successfully", subscription: updated });
+    } catch (err) {
+        console.error("Error cancelling subscription:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/subscriptions/:id/refund', authenticateMerchant, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { amount, reason, prorated } = req.body || {};
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: sub, error } = await supabase
+            .from('subscriptions')
+            .select('*, plans(*)')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
+        if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
+
+        const merchantId = sub.plans?.merchant_id;
+        const refundAmount = amount ?? sub.plans?.usdc_amount;
+
+        await writeAuditLog(supabase, {
+            merchantId,
+            actorAddress: getActorAddress(req, sub.customer_wallet_address),
+            action: 'subscription.refund',
+            resourceType: 'subscription',
+            resourceId: id,
+            ipAddress: getClientIp(req),
+            changesBefore: null,
+            changesAfter: { amount: refundAmount, reason, prorated: !!prorated },
+        });
+
+        if (merchantId) {
+            await dispatchWebhookEvent(supabase, {
+                merchantId,
+                eventType: 'payment.refunded',
+                payload: {
+                    event: 'payment.refunded',
+                    subscription_id: id,
+                    customer_wallet_address: sub.customer_wallet_address,
+                    refund_amount: refundAmount,
+                    reason: reason || 'Customer refund request',
+                    prorated: !!prorated,
+                },
+                fetchImpl: app.locals.fetchImpl,
+            });
+        }
+
+        res.status(200).json({
+            message: "Refund processed successfully",
+            refund: {
+                subscription_id: id,
+                amount: refundAmount,
+                reason: reason || 'Customer refund request',
+                prorated: !!prorated,
+            },
+        });
+    } catch (err) {
+        console.error("Error processing refund:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/subscriptions/:id/timeline', authenticateMerchant, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: sub, error } = await supabase
+            .from('subscriptions')
+            .select('*, plans(*)')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(error) || !sub) return res.status(404).json({ error: "Subscription not found" });
+        if (error) throw error;
+        // Never disclose whether another merchant owns this subscription.
+        if (sub.plans?.merchant_id !== req.merchant.id) {
+            return res.status(404).json({ error: "Subscription not found" });
+        }
+
+        const { data: logs } = await supabase
+            .from('audit_logs')
+            .select('*')
+            .eq('resource_id', id)
+            .order('created_at', { ascending: false });
+
+        const timeline = [];
+
+        timeline.push({
+            id: `created-${id}`,
+            type: 'subscription_created',
+            title: 'Vault Handshake Established',
+            description: `Subscriber linked Ed25519 wallet to ${sub.plans?.name || 'plan'}`,
+            timestamp: sub.created_at || new Date().toISOString(),
+            status: 'success',
+        });
+
+        if (logs && Array.isArray(logs)) {
+            for (const log of logs) {
+                if (log.action === 'pull.execute') {
+                    timeline.push({
+                        id: log.id,
+                        type: 'settled_pull',
+                        title: 'Recurring USDC Pull Settled',
+                        description: 'Contract executed pull_funds with 1.2s Soroban consensus finality',
+                        amount: sub.plans?.usdc_amount,
+                        timestamp: log.created_at,
+                        status: 'success',
+                        txHash: log.changes_after?.txHash,
+                    });
+                } else if (log.action === 'subscription.past_due') {
+                    timeline.push({
+                        id: log.id,
+                        type: 'failed_pull',
+                        title: 'Pull Attempt Failed',
+                        description: 'Account balance insufficient or allowance limit reached. Dunning cycle started.',
+                        timestamp: log.created_at,
+                        status: 'failed',
+                    });
+                } else if (log.action === 'subscription.dunning_retry') {
+                    timeline.push({
+                        id: log.id,
+                        type: 'dunning_retry',
+                        title: `Automated Dunning Attempt #${log.changes_after?.retry_count || 1}`,
+                        description: 'Smart recovery schedule retry triggered with merchant webhook dispatch.',
+                        timestamp: log.created_at,
+                        status: 'warning',
+                    });
+                } else if (log.action === 'subscription.refund') {
+                    timeline.push({
+                        id: log.id,
+                        type: 'refund',
+                        title: 'Prorated Refund Issued',
+                        description: `Refund credited back to subscriber (${log.changes_after?.reason || 'merchant initiated'})`,
+                        amount: log.changes_after?.amount,
+                        timestamp: log.created_at,
+                        status: 'info',
+                    });
+                } else if (log.action === 'subscription.cancel' || log.action === 'subscription.dunning_cancelled') {
+                    timeline.push({
+                        id: log.id,
+                        type: 'cancelled',
+                        title: log.action === 'subscription.dunning_cancelled' ? 'Cancelled (Dunning Expired)' : 'Subscription Cancelled',
+                        description: 'Vault allowance revoked and recurrence stopped.',
+                        timestamp: log.created_at,
+                        status: 'failed',
+                    });
+                }
+            }
+        }
+
+        timeline.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+        res.status(200).json({ timeline, subscription: sub });
+    } catch (err) {
+        console.error("Error fetching timeline:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==========================================
+// ROUTE 9: WEBHOOK MANAGEMENT & DELIVERY LOGS
+// ==========================================
+app.get('/webhooks', async (req, res) => {
+    try {
+        const { merchant_id } = req.query;
+        if (!merchant_id) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data, error } = await supabase
+            .from('webhooks')
+            .select('*')
+            .eq('merchant_id', merchant_id)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.status(200).json({ webhooks: data || [] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks', async (req, res) => {
+    const parseResult = createWebhookSchema.safeParse(req.body);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { merchant_id, url, events, signing_secret } = parseResult.data;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const secret = signing_secret || generateSigningSecret();
+        const { data, error } = await supabase
+            .from('webhooks')
+            .insert([{
+                merchant_id,
+                url,
+                events,
+                signing_secret: secret,
+                active: true,
+            }])
+            .select()
+            .single();
+
+        if (isForeignKeyError(error)) return res.status(404).json({ error: "Merchant not found" });
+        if (error) throw error;
+
+        await writeAuditLog(supabase, {
+            merchantId: merchant_id,
+            actorAddress: getActorAddress(req, null),
+            action: 'webhook.create',
+            resourceType: 'webhook',
+            resourceId: data.id,
+            ipAddress: getClientIp(req),
+            changesBefore: null,
+            changesAfter: { url, events, active: true },
+        });
+
+        res.status(201).json({ message: "Webhook created successfully", webhook: data });
+    } catch (err) {
+        console.error("Error creating webhook:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/webhooks/:id', async (req, res) => {
+    const parseResult = updateWebhookSchema.safeParse(req.body);
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: existing, error: existErr } = await supabase
+            .from('webhooks')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(existErr) || !existing) return res.status(404).json({ error: "Webhook not found" });
+        if (existErr) throw existErr;
+
+        const updateData = {};
+        if (parseResult.data.url !== undefined) updateData.url = parseResult.data.url;
+        if (parseResult.data.events !== undefined) updateData.events = parseResult.data.events;
+        if (parseResult.data.active !== undefined) updateData.active = parseResult.data.active;
+        if (parseResult.data.signing_secret !== undefined) updateData.signing_secret = parseResult.data.signing_secret;
+
+        const { data: updated, error: updateErr } = await supabase
+            .from('webhooks')
+            .update(updateData)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (updateErr) throw updateErr;
+
+        await writeAuditLog(supabase, {
+            merchantId: existing.merchant_id,
+            actorAddress: getActorAddress(req, null),
+            action: 'webhook.update',
+            resourceType: 'webhook',
+            resourceId: id,
+            ipAddress: getClientIp(req),
+            changesBefore: existing,
+            changesAfter: updated,
+        });
+
+        res.status(200).json({ message: "Webhook updated successfully", webhook: updated });
+    } catch (err) {
+        console.error("Error updating webhook:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/webhooks/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { data: existing, error: existErr } = await supabase
+            .from('webhooks')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (isNoRowsError(existErr) || !existing) return res.status(404).json({ error: "Webhook not found" });
+        if (existErr) throw existErr;
+
+        const { error: delErr } = await supabase
+            .from('webhooks')
+            .delete()
+            .eq('id', id);
+
+        if (delErr) throw delErr;
+
+        await writeAuditLog(supabase, {
+            merchantId: existing.merchant_id,
+            actorAddress: getActorAddress(req, null),
+            action: 'webhook.delete',
+            resourceType: 'webhook',
+            resourceId: id,
+            ipAddress: getClientIp(req),
+            changesBefore: existing,
+            changesAfter: null,
+        });
+
+        res.status(200).json({ message: "Webhook deleted successfully" });
+    } catch (err) {
+        console.error("Error deleting webhook:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/webhooks/deliveries', async (req, res) => {
+    try {
+        const { merchant_id, webhook_id, limit = 50, offset = 0 } = req.query;
+        if (!merchant_id) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        let query = supabase
+            .from('webhook_deliveries')
+            .select('*, webhooks(url)', { count: 'exact' })
+            .eq('merchant_id', merchant_id);
+
+        if (webhook_id) query = query.eq('webhook_id', webhook_id);
+
+        query = query
+            .order('created_at', { ascending: false })
+            .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+        const { data, count, error } = await query;
+        if (error) throw error;
+
+        res.status(200).json({
+            deliveries: data || [],
+            total: count ?? (data?.length || 0),
+            limit: Number(limit),
+            offset: Number(offset),
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks/deliveries/:id/resend', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const updated = await resendWebhookDelivery(supabase, id, app.locals.fetchImpl);
+        if (!updated) return res.status(404).json({ error: "Delivery record not found" });
+
+        res.status(200).json({ message: "Webhook redelivered successfully", delivery: updated });
+    } catch (err) {
+        console.error("Error resending webhook delivery:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Webhook dead-letter queue (#229): deliveries that failed every automatic retry
+app.get('/webhooks/dead-letters', async (req, res) => {
+    try {
+        const { merchant_id, webhook_id, limit = 50, offset = 0 } = req.query;
+        if (!merchant_id) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        let query = supabase
+            .from('webhook_dead_letters')
+            .select('*', { count: 'exact' })
+            .eq('merchant_id', merchant_id);
+        if (webhook_id) query = query.eq('webhook_id', webhook_id);
+
+        const { data, count, error } = await query
+            .order('failed_at', { ascending: false })
+            .range(Number(offset), Number(offset) + Number(limit) - 1);
+        if (error) throw error;
+
+        res.status(200).json({
+            dead_letters: data || [],
+            total: count ?? (data?.length || 0),
+            limit: Number(limit),
+            offset: Number(offset),
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks/dead-letters/:id/replay', async (req, res) => {
+    try {
+        const merchantId = req.body?.merchant_id;
+        if (!merchantId) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const deadLetter = await replayDeadLetter(supabase, req.params.id, {
+            merchantId,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (!deadLetter) return res.status(404).json({ error: "Dead letter not found" });
+
+        res.status(200).json({
+            message: deadLetter.replay_status === 'success'
+                ? "Dead letter replayed successfully"
+                : "Dead letter replay failed; the endpoint is still rejecting deliveries",
+            dead_letter: deadLetter,
+        });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ error: err.message });
+        console.error("Error replaying webhook dead letter:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks/test', async (req, res) => {
+    try {
+        const { merchant_id, webhook_id, event_type = "payment.settled" } = req.body || {};
+        if (!merchant_id) return res.status(400).json({ error: "merchant_id is required" });
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const testPayload = {
+            event: event_type,
+            test: true,
+            timestamp: new Date().toISOString(),
+            data: {
+                subscription_id: crypto.randomUUID(),
+                customer_wallet_address: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                amount: 290000000,
+                currency: "USDC",
+                status: "success",
+            },
+        };
+
+        const deliveries = await dispatchWebhookEvent(supabase, {
+            merchantId: merchant_id,
+            eventType: event_type,
+            payload: testPayload,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Test webhook event triggered",
+            dispatched_count: deliveries.length,
+            deliveries,
+        });
+    } catch (err) {
+        console.error("Error sending test webhook:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Rotate without downtime: keep the old secret for in-flight retries and use
+// the new one for all subsequent deliveries.
+app.post('/webhooks/:id/rotate-secret', async (req, res) => {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+    const secret = generateSigningSecret();
+    const { data, error } = await supabase.from('webhooks').update({ previous_signing_secret: req.body?.signing_secret || null, signing_secret: secret, secret_rotated_at: new Date().toISOString() }).eq('id', req.params.id).select('id,secret_rotated_at').single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ webhook: data, signing_secret: secret });
+});
+
+app.post('/webhooks/:id/verify', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+        const result = await verifyWebhookEndpoint(supabase, {
+            webhookId: req.params.id,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (result.statusCode) return res.status(result.statusCode).json({ error: result.error });
+        res.status(result.ok ? 200 : 502).json(result);
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
+app.post('/webhooks/:id/backfill', async (req, res) => {
+    const parseResult = backfillWebhookSchema.safeParse(req.body || {});
+    if (!parseResult.success) {
+        return res.status(400).json({ error: formatZodError(parseResult.error) });
+    }
+
+    try {
+        const { id } = req.params;
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: "Supabase client not initialized" });
+
+        const { event_types, start_date, end_date } = parseResult.data;
+        const result = await replayWebhookEvents(supabase, {
+            webhookId: id,
+            eventTypes: event_types,
+            startDate: start_date,
+            endDate: end_date,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        res.status(200).json({
+            message: "Webhook backfill completed successfully",
+            total_events: result.total_events,
+            replayed_count: result.replayed_count,
+            deliveries: result.deliveries,
+        });
+    } catch (err) {
+        if (err.status === 404 || err.message === 'Webhook not found') {
+            return res.status(404).json({ error: "Webhook not found" });
+        }
+        console.error("Error executing webhook backfill:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+registerComplianceRoutes(app, getSupabase, authenticateMerchant);
+registerOrganizationRoutes(app, getSupabase, authenticateMerchant);
+registerInvoiceRoutes(app, getSupabase, authenticateMerchant);
+registerRpcProxyRoute(app);
+registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
+registerCohortRoutes(app, getSupabase, authenticateMerchant);
+registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerBalanceReminderRoutes(app, { getSupabase, authenticateMerchant });
+registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
+registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
+
+// Webhook incident alerting: Slack / PagerDuty / email channels and failure telemetry (#189)
+registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
+
+// Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
+registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
+setEndpointAlertNotifier(createEndpointAlertNotifier(getSupabase));
+registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
+registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
+registerCouponRoutes(app, getSupabase, authenticateMerchant);
+registerBillingResolutionRoutes(app, getSupabase, authenticateMerchant, loadPullContext, getSorobanServer);
+registerPayoutSplitRoutes(app, getSupabase, authenticateMerchant, {
+    resolveDispatcher: () => getPayoutSplitDispatcher(),
+});
+registerPriceIndexationRoutes(app, getSupabase, authenticateMerchant);
+registerSnapshotRoutes(app, getSupabase, authenticateMerchant, getSorobanServer);
+registerHealthMetrics(app, { getSupabase, getSorobanServer, rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org' });
+// orbit_db_pool_active (#230): connections checked out of the backend's pg pools
+setDbPoolSource(() => [
+    dbManager.primaryPool,
+    ...dbManager.replicaPools,
+    app.locals.reportPool,
+    app.locals.reportReplicaPool,
+]);
+registerIndexerRoutes(app);
+registerStripeBillingRoutes(app, getSupabase, authenticateMerchant);
+const credentialService = registerCredentialRoutes(app, getSupabase, authenticateMerchant);
+registerHandoverRoutes(app, getSupabase, {
+    rpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+    contractId: process.env.ORBIT_CONTRACT_ID,
+    tokenContractId: process.env.USDC_CONTRACT_ID || process.env.TOKEN_CONTRACT_ID,
+});
+app.locals.paymentEventBus = createSubscriptionEventBus();
+app.locals.graphqlServer = registerGraphql(app, getSupabase, authenticateMerchant);
+
+// Merchant profile & custom contract persistence (#143)
+app.get('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getReadSupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        const { data, error } = await supabase
+            .from('merchants')
+            .select('id, name, wallet_address, contract_id, created_at')
+            .eq('id', req.merchant.id)
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/merchant/profile', authenticateMerchant, async (req, res) => {
+    try {
+        const supabase = getPrimarySupabase();
+        if (!supabase) return res.status(500).json({ error: "Database client not initialized" });
+        if (!dbManager.isPrimaryHealthy()) {
+            return res.status(503).json({ error: "Primary database is currently unavailable; write operations are suspended" });
+        }
+        const updates = {};
+        if (typeof req.body?.name === 'string' && req.body.name.trim()) {
+            updates.name = req.body.name.trim();
+        }
+        if (typeof req.body?.contract_id === 'string' && req.body.contract_id.trim()) {
+            updates.contract_id = req.body.contract_id.trim();
+        }
+        const { data, error } = await supabase
+            .from('merchants')
+            .update(updates)
+            .eq('id', req.merchant.id)
+            .select('id, name, wallet_address, contract_id, created_at')
+            .single();
+        if (error) throw error;
+        res.status(200).json({ merchant: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PostgreSQL protocol cursor: unlike Supabase REST pagination, the cursor
+// never materializes the full transaction table in application memory.
+const getReportPool = () => {
+    return dbManager.getReportPool(app, { readOnly: true });
+};
+registerTransactionExportRoute(
+    app, authenticateMerchant, getReportPool,
+    (sql, values) => {
+        const Cursor = require('pg-cursor');
+        return new Cursor(sql, values);
+    },
+);
+
+const PORT = process.env.PORT || 3001;
+function startServer() {
+    if (getSupabase() && process.env.INDEXER_START_LEDGER) {
+        app.locals.ledgerIndexer = configuredIndexer(getSupabase());
+        app.locals.indexerWorker = app.locals.ledgerIndexer.start(Number(process.env.INDEXER_INTERVAL_MS) || 5000);
+    }
+    // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
+    // schedule so /rates and dynamic fiat billing always read fresh quotes.
+    const oracleSupabase = getSupabase();
+    if (process.env.RECURRING_PULLS_ENABLED === 'true' && !oracleSupabase) {
+        throw new Error('Supabase must be configured when recurring pulls are enabled');
+    }
+    if (oracleSupabase) {
+        app.locals.oracleWorker = startOracleWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+
+        // Price indexation worker (#164): notifies subscribers inside the advance
+        // notice window and applies scheduled plan price changes on their
+        // effective date.
+        app.locals.priceIndexationWorker = createPriceIndexationWorker({
+            supabase: oracleSupabase,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        app.locals.priceIndexationWorker.start(
+            Number(process.env.PRICE_INDEXATION_INTERVAL_MS) || undefined,
+        );
+
+        // Daily contract state snapshot backup worker (#185): exports Soroban
+        // vaults, plans, and admin configs with SHA-256 integrity checksums.
+        if (process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID) {
+            app.locals.snapshotExportWorker = createSnapshotExportWorker({
+                server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                supabase: oracleSupabase,
+                contractId: process.env.ORBIT_CONTRACT_ID || process.env.SOROBAN_CONTRACT_ID,
+            });
+            app.locals.snapshotExportWorker.start(
+                Number(process.env.SNAPSHOT_EXPORT_INTERVAL_MS) || undefined,
+            );
+        }
+
+        if (process.env.RECURRING_PULLS_ENABLED === 'true') {
+            const contractId = process.env.ORBIT_CONTRACT_ID;
+            if (!contractId) throw new Error('ORBIT_CONTRACT_ID is required when recurring pulls are enabled');
+            const relayer = getRelayer();
+            if (!relayer) throw new Error('RELAYER_SECRET_KEY is required when recurring pulls are enabled');
+            const signer = createRemoteMerchantSigner({
+                url: process.env.RECURRING_PULL_SIGNER_URL,
+                token: process.env.RECURRING_PULL_SIGNER_TOKEN,
+                fetchImpl: app.locals.fetchImpl,
+            });
+            const recurringPullOptions = {};
+            if (process.env.RECURRING_PULL_MAX_ATTEMPTS) {
+                const maxAttempts = Number(process.env.RECURRING_PULL_MAX_ATTEMPTS);
+                if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+                    throw new Error('RECURRING_PULL_MAX_ATTEMPTS must be a positive integer');
+                }
+                recurringPullOptions.maxAttempts = maxAttempts;
+            }
+            const recurringPullWorker = createRecurringPullWorker({
+                store: createRecurringPullStore(oracleSupabase),
+                relayer,
+                signer,
+                contractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                waitForTransaction: (hash, options) => waitForTransaction(
+                    getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                    hash,
+                    options,
+                ),
+                settle: async ({ sub, merchant, transactionHash, confirmation, settledAt, nextBillingDate }) => {
+                    await applyPullOutcome({
+                        supabase: oracleSupabase,
+                        req: null,
+                        sub,
+                        merchant,
+                        subscription_id: sub.id,
+                        txHash: transactionHash,
+                        status: confirmation.status,
+                        confirmation,
+                        extraBody: { automated: true },
+                        subscriptionAlreadySettled: true,
+                        settledAt,
+                        nextBillingDate,
+                    });
+                },
+                fail: async ({ sub, merchant, transactionHash, error }) => {
+                    await recordPullFailure(oracleSupabase, sub.id, error, transactionHash);
+                    await markSubscriptionPastDue(oracleSupabase, sub.id, {
+                        actorAddress: merchant.wallet_address,
+                        fetchImpl: app.locals.fetchImpl,
+                    });
+                },
+                options: recurringPullOptions,
+            });
+            app.locals.recurringPullWorker = startRecurringPullWorker(recurringPullWorker, {
+                intervalMs: Number(process.env.RECURRING_PULL_INTERVAL_MS) || undefined,
+            });
+        }
+    } else {
+        console.warn("Oracle worker not started: Supabase client not initialized");
+    }
+
+    // Stellar exchange-rate worker (#303): runs independently of request
+    // handling even when no database is configured, and degrades to cache or
+    // static baselines rather than failing startup.
+    app.locals.exchangeRateWorker = getExchangeRateWorker();
+    app.locals.exchangeRateWorker.start();
+
+    const usageInterval = setInterval(() => {
+        const buffer = getUsageBuffer(), supabase = getSupabase();
+        if (buffer && supabase) rollupUsage({ buffer, supabase }).catch((err) => console.error('Usage rollup failed:', err));
+    }, Number(process.env.USAGE_ROLLUP_INTERVAL_MS) || 300000);
+    usageInterval.unref();
+
+    const httpServer = app.listen(PORT, () => {
+        console.log(`Orbit Merchant API running on http://localhost:${PORT}`);
+    });
+    app.locals.graphqlServer.attachWebsocket(httpServer);
+
+    let shuttingDown = false;
+    const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        app.locals.exchangeRateWorker?.stop();
+        app.locals.oracleWorker?.stop?.();
+        httpServer.close(() => process.exit(0));
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
+}
+
+// Pre-flight schema guard (#157): never serve against a database whose
+// migrations don't match this build.
+if (require.main === module) {
+    checkSchemaOnStartup()
+        .then(startServer)
+        .catch((err) => {
+            console.error(`Startup aborted: ${err.message}`);
+            process.exit(1);
+        });
+}
+
+
+// Simulation footprint cache shared across requests (#290).
+const sharedSimulationCache = new SimulationCache({
+    ttlLedgers: Number(process.env.SIM_CACHE_TTL_LEDGERS) || 10,
+});
+
+// POST /simulate/quote — unauthenticated read-only endpoint that returns a
+// cached simulation result for the given transaction XDR (#290). The result
+// is served from the in-process ledger-TTL cache when possible, saving
+// 400-800ms per duplicate pre-flight call.
+app.post('/simulate/quote', createRpcIpWindowLimiter({ limit: Number(process.env.RPC_PROXY_RATE_LIMIT_MAX) || 60 }), async (req, res) => {
+    const { transaction } = req.body || {};
+    if (!transaction || typeof transaction !== 'string') {
+        return res.status(400).json({ error: 'transaction (base64 XDR) is required' });
+    }
+    const proxy = app.locals.rpcProxy;
+    if (!proxy) return res.status(503).json({ error: 'RPC proxy not available' });
+    try {
+        const ledgerResp = await proxy.call({ method: 'getLatestLedger', params: [] });
+        const ledger = ledgerResp?.result?.sequence ?? 0;
+        const cacheKey = `simulateTransaction:${transaction}`;
+        const { value, source } = await getOrSimulate(sharedSimulationCache, cacheKey, {
+            ledger,
+            simulate: () => proxy.call({ method: 'simulateTransaction', params: [{ transaction }] }),
+        });
+        res.json({ ...value, cached: source === 'cache' });
+    } catch (err) {
+        res.status(err.statusCode || 502).json({ error: err.message });
+    }
+});
+
+// GET /payroll/streams — returns active streaming payroll streams for the merchant (#291).
+app.get('/payroll/streams', authenticateMerchant, async (req, res) => {
+    const supabase = getReadSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Database client not initialized' });
+    const { data, error } = await supabase
+        .from('payroll_streams')
+        .select('id, recipient_address, recipient_label, token_symbol, rate_per_second, start_time, end_time, withdrawn_amount')
+        .eq('merchant_id', req.merchant.id)
+        .eq('active', true)
+        .order('start_time', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const streams = (data || []).map((row) => ({
+        id: row.id,
+        recipientLabel: row.recipient_label || row.recipient_address,
+        tokenSymbol: row.token_symbol || 'USDC',
+        ratePerSecond: Number(row.rate_per_second) || 0,
+        startTime: new Date(row.start_time).getTime(),
+        endTime: new Date(row.end_time).getTime(),
+        withdrawnAmount: Number(row.withdrawn_amount) || 0,
+    }));
+    res.json({ streams });
+});
+
+// POST /payroll/streams/claim — submit a withdraw_from_stream transaction (#291).
+app.post('/payroll/streams/claim', authenticateMerchant, async (req, res) => {
+    const { stream_id, amount, sender_address } = req.body || {};
+    if (!stream_id || !amount || !sender_address) {
+        return res.status(400).json({ error: 'stream_id, amount, and sender_address are required' });
+    }
+    if (typeof amount !== 'number' || amount <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!StrKey.isValidEd25519PublicKey(sender_address)) {
+        return res.status(400).json({ error: 'sender_address must be a valid Stellar public key' });
+    }
+    const supabase = getPrimarySupabase();
+    const { data: streamRow, error: strErr } = await supabase
+        .from('payroll_streams')
+        .select('id, merchant_id')
+        .eq('id', stream_id)
+        .eq('merchant_id', req.merchant.id)
+        .maybeSingle();
+    if (strErr || !streamRow) return res.status(404).json({ error: 'Stream not found or access denied' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json({ error: 'Transaction relayer is not configured' });
+    const contractId = process.env.ORBIT_CONTRACT_ID;
+    if (!contractId) return res.status(503).json({ error: 'ORBIT_CONTRACT_ID is not configured' });
+    try {
+        const { rpc: RpcLib, Networks, TransactionBuilder, BASE_FEE, Contract, nativeToScVal } = require('@stellar/stellar-sdk');
+        const server = getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org');
+        const account = await server.getAccount(sender_address);
+        const rawAmount = BigInt(Math.round(amount * 10_000_000));
+        const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        })
+            .addOperation(
+                new Contract(contractId).call(
+                    'withdraw_from_stream',
+                    nativeToScVal(BigInt(stream_id), { type: 'u64' }),
+                    nativeToScVal(rawAmount, { type: 'i128' }),
+                )
+            )
+            .setTimeout(60)
+            .build();
+        const result = await relayer.relay(tx);
+        if (result.status !== 'SUCCESS') return res.status(502).json({ error: 'Transaction failed', result });
+        res.json({ tx_hash: result.hash, status: result.status });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+module.exports = app;

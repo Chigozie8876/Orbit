@@ -127,6 +127,57 @@ hold spendable XLM for this invocation because a separate funded transaction
 source submits it. This contract does not create or fund a Stellar account base
 reserve, and it cannot make a nonexistent classic account usable by itself.
 
+## Delegated vault authorization via typed signatures (#296)
+
+`create_vault_delegated(authorization, signature)` creates a vault from a
+payload the subscriber signed off-chain. Any account can submit it, typically
+the backend relayer (`POST /api/relayer/sponsor`) or a fee-bump submitter. The
+subscriber needs no XLM and no Soroban authorization entry, only the signature.
+
+The signed payload is the typed `DelegatedVaultAuthorization`:
+
+| Field | Meaning |
+|-------|---------|
+| `user` | Subscriber. Must be an Ed25519 account (`G...`) |
+| `merchant`, `token` | Who may pull, and in which token. Both are signed, so a relayer cannot redirect the vault or swap the token |
+| `amount` | Amount per interval, in base units |
+| `interval_ledgers` | Billing interval in ledgers. Stored as `interval_ledgers * 5` seconds, the same unit as every other vault |
+| `nonce` | Must equal `get_user_nonce(user)`; consumed on success |
+| `expiry_ledger` | Last ledger sequence at which the signature is accepted |
+
+The subscriber signs, with their account key, the 32-byte
+`delegated_vault_digest`:
+
+```
+SHA256(contract_address_xdr || network_id || Symbol("create_vault_delegated")_xdr || XDR(authorization))
+```
+
+The contract address and network id bind the signature to one deployment on one
+network. The function symbol keeps the bytes from verifying as any other signed
+Orbit message.
+
+Checks run cheapest first, so a stale request costs a single storage read:
+
+1. `SignatureExpired` when the current ledger is past `expiry_ledger`.
+2. `InvalidNonce` when `nonce` is not current: a replay, or a signature made
+   for a future nonce.
+3. `InvalidAuthorization` when `amount <= 0`, `interval_ledgers == 0`, or the
+   interval overflows.
+4. `InvalidSignature` when `user` is not an Ed25519 account, so it cannot have
+   signed.
+5. One `ed25519_verify` over the digest. A forged signature, one from another
+   key, or one over tampered terms fails here. Soroban's `ed25519_verify` has
+   no non-trapping form, so the host aborts the invocation with its own Crypto
+   error rather than a contract error code. Nothing is written and the nonce is
+   not consumed.
+
+On success, the nonce is consumed and the vault is written with the default
+grace period. The standard `vault_created` event fires, followed by
+`vault_delegated(user, merchant) -> (token, amount, interval_ledgers, nonce)`.
+The nonce is the same per-user counter that `create_vault_with_signature`
+(#207) uses, so a signature for one scheme can never be replayed through the
+other.
+
 ## Verification
 
 Soroban SDK 27.0.6 requires Rust 1.91 or newer. From `contracts/soroban`:

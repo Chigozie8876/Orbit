@@ -120,7 +120,10 @@ export default function HostedCheckoutPage({ params }: { params: Promise<{ id: s
       const result = await createCheckoutVault({ address, merchant: plan.merchants.wallet_address,
         amount: Number(plan.usdc_amount), interval: Number(plan.interval_seconds), cycles: recurring ? 12 : 1 });
       const response = await fetch(`${ORBIT_API_URL}/subscriptions`, { method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ plan_id: plan.id, customer_wallet_address: address }) });
+        // The email was collected but never sent, so merchants had no way to reach the
+        // subscriber; it now backs the dashboard's balance reminders (#298).
+        body: JSON.stringify({ plan_id: plan.id, customer_wallet_address: address,
+          ...(customerEmail.trim() ? { metadata: { customer_email: customerEmail.trim() } } : {}) }) });
       const recovering = new URLSearchParams(window.location.search).get("recovery") === "true";
       // Recovery renews an existing allowance; the subscription stays past_due
       // until the merchant settles a real pull. An existing record is expected.

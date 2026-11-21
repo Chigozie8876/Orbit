@@ -307,10 +307,12 @@ fn fuzz_invariant_distribution_and_metered_cap_integrity() {
         splits.push_back(PaymentSplit {
             recipient: recipient_a.clone(),
             amount: split_a,
+            token: token_address.clone(),
         });
         splits.push_back(PaymentSplit {
             recipient: recipient_b.clone(),
             amount: split_b,
+            token: token_address.clone(),
         });
         let batch_ok = client.try_batch_disburse(&user, &token_address, &splits);
         assert!(batch_ok.is_ok());
@@ -320,6 +322,7 @@ fn fuzz_invariant_distribution_and_metered_cap_integrity() {
         extra_splits.push_back(PaymentSplit {
             recipient: recipient_a.clone(),
             amount: 1,
+            token: token_address.clone(),
         });
         let extra_res = client.try_batch_disburse(&user, &token_address, &extra_splits);
         assert!(extra_res.is_err());

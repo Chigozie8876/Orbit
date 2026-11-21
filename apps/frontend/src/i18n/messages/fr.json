@@ -161,7 +161,8 @@
       "settled": "Total réglé",
       "nextPull": "Prochain prélèvement",
       "status": "Statut du coffre",
-      "actions": "Actions"
+      "actions": "Actions",
+      "health": "Santé"
     },
     "payroll": {
       "contractor": "Prestataire",
@@ -290,5 +291,46 @@
     "confirmedOneTime": "Votre autorisation unique est active sur Stellar testnet.",
     "viewTx": "Voir la transaction",
     "returnToMerchant": "Retourner chez le marchand"
+  },
+  "SubscriberHealth": {
+    "level": {
+      "good": "BONNE",
+      "warning": "ALERTE",
+      "critical": "CRITIQUE"
+    },
+    "notScored": "—",
+    "noRisk": "Aucun risque de renouvellement : solde, autorisation et prélèvements récents en bon état.",
+    "factors": {
+      "insufficient_balance": "Solde USDC insuffisant détecté on-chain : le portefeuille ne couvre pas le prochain prélèvement de {amount} USDC.",
+      "low_balance": "Solde USDC faible on-chain ({balance} USDC) : de quoi couvrir au plus un prélèvement de {amount} USDC.",
+      "allowance_exhausted": "L'autorisation du coffre est épuisée : Orbit ne peut pas prélever le prochain paiement tant que l'abonné ne l'a pas renouvelée.",
+      "allowance_low": "L'autorisation du coffre ne couvre que {cycles, plural, =0 {aucun cycle de plus} one {# cycle de plus} other {# cycles de plus}}.",
+      "allowance_expired": "L'autorisation du coffre a expiré : le dernier prélèvement a été refusé on-chain.",
+      "pull_failures": "{count, plural, one {# prélèvement récent a échoué} other {# prélèvements récents ont échoué}}.",
+      "past_due": "Le paiement est en retard et en cours de relance.",
+      "due_soon": "Le renouvellement est dû {hours, plural, =0 {maintenant} one {dans # heure} other {dans # heures}}, sans laisser le temps au problème de se résoudre."
+    },
+    "card": {
+      "title": "{count, plural, one {# abonné à risque de résiliation} other {# abonnés à risque de résiliation}}",
+      "subtitle": "Renouvellements susceptibles d’échouer : solde faible, autorisation épuisée ou prélèvements échoués à répétition.",
+      "critical": "{count} critiques",
+      "warning": "{count} en alerte",
+      "revenueLabel": "Revenus à risque au prochain cycle",
+      "criticalRevenue": "{amount} USDC des abonnés critiques",
+      "viewAtRisk": "Voir les abonnés à risque",
+      "showAll": "Afficher tous les abonnés",
+      "allHealthy": "{count, plural, one {L'abonné en renouvellement est en bonne santé.} other {Les # abonnés en renouvellement sont en bonne santé.}}"
+    },
+    "reminder": {
+      "send": "Relancer",
+      "sending": "Envoi…",
+      "title": "Envoyer à l'abonné un lien pour approvisionner son portefeuille ou renouveler son autorisation",
+      "sent": "Rappel de solde envoyé à {recipient}.",
+      "demoRecipient": "l'abonné de démonstration",
+      "failed": "Rappel non envoyé : {error}",
+      "noEmail": "Aucun e-mail enregistré : l'abonné n'en a pas laissé lors du paiement.",
+      "cooldown": "Un rappel a déjà été envoyé au cours des dernières 24 heures.",
+      "dismiss": "Fermer"
+    }
   }
 }

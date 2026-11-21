@@ -36,7 +36,7 @@ import {
   evaluatePlanLifecyclePolicy,
 } from "@/lib/plan-migration";
 
-const INITIAL_PLANS: SubscriptionPlan[] = [
+export const INITIAL_PLANS: SubscriptionPlan[] = [
   {
     id: "plan_mailkit_pro",
     name: "MailKit Pro",

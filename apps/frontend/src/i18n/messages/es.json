@@ -161,7 +161,8 @@
       "settled": "Total liquidado",
       "nextPull": "Próximo cobro",
       "status": "Estado de la bóveda",
-      "actions": "Acciones"
+      "actions": "Acciones",
+      "health": "Salud"
     },
     "payroll": {
       "contractor": "Contratista",
@@ -290,5 +291,46 @@
     "confirmedOneTime": "Tu autorización única está activa en Stellar testnet.",
     "viewTx": "Ver transacción",
     "returnToMerchant": "Volver al comercio"
+  },
+  "SubscriberHealth": {
+    "level": {
+      "good": "BUENA",
+      "warning": "AVISO",
+      "critical": "CRÍTICA"
+    },
+    "notScored": "—",
+    "noRisk": "Sin riesgo de renovación: saldo, autorización y cobros recientes en buen estado.",
+    "factors": {
+      "insufficient_balance": "Saldo de USDC insuficiente en la cadena: la billetera no cubre el próximo cobro de {amount} USDC.",
+      "low_balance": "Saldo de USDC bajo en la cadena ({balance} USDC): alcanza como mucho para un cobro más de {amount} USDC.",
+      "allowance_exhausted": "La autorización de la bóveda se agotó: Orbit no puede cobrar el próximo pago hasta que el suscriptor la renueve.",
+      "allowance_low": "La autorización de la bóveda cubre solo {cycles, plural, =0 {ningún ciclo más} one {# ciclo más} other {# ciclos más}}.",
+      "allowance_expired": "La autorización de la bóveda expiró: el último cobro fue rechazado en la cadena.",
+      "pull_failures": "{count, plural, one {# cobro reciente falló} other {# cobros recientes fallaron}}.",
+      "past_due": "El pago está vencido y en reintentos de cobro.",
+      "due_soon": "La renovación vence {hours, plural, =0 {ahora} one {en # hora} other {en # horas}}, sin tiempo para que el problema se resuelva solo."
+    },
+    "card": {
+      "title": "{count, plural, one {# suscriptor en riesgo de baja} other {# suscriptores en riesgo de baja}}",
+      "subtitle": "Renovaciones que probablemente fallen por saldo bajo, autorización agotada o cobros fallidos repetidos.",
+      "critical": "{count} críticos",
+      "warning": "{count} con aviso",
+      "revenueLabel": "Ingresos en riesgo el próximo ciclo",
+      "criticalRevenue": "{amount} USDC de suscriptores críticos",
+      "viewAtRisk": "Ver suscriptores en riesgo",
+      "showAll": "Mostrar todos",
+      "allHealthy": "{count, plural, one {El suscriptor con renovación está en buen estado.} other {Los # suscriptores con renovación están en buen estado.}}"
+    },
+    "reminder": {
+      "send": "Recordar",
+      "sending": "Enviando…",
+      "title": "Enviar al suscriptor un enlace para recargar su billetera o renovar su autorización",
+      "sent": "Recordatorio de saldo enviado a {recipient}.",
+      "demoRecipient": "el suscriptor de demostración",
+      "failed": "Recordatorio no enviado: {error}",
+      "noEmail": "Sin correo registrado: el suscriptor no dejó uno al pagar.",
+      "cooldown": "Ya se envió un recordatorio en las últimas 24 horas.",
+      "dismiss": "Cerrar"
+    }
   }
 }

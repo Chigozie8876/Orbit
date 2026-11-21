@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { resolveCheckoutTheme } from "./checkoutTheme";
 import { checkUsdcReadiness, usdcReadinessMessage } from "./usdcReadiness";
+import { formatPromoTerms, promoAuthorization, validatePromoCode } from "./promo";
 import { CHECKOUT_EVENTS, createCheckoutMessageBridge } from "./checkoutMessageBridge";
 import gsap from "gsap";
 import {
@@ -124,6 +125,8 @@ export default function OrbitCheckout({
   customClasses = {},
   allowedOrigins = DEFAULT_ALLOWED_ORIGINS,
   customFields = [],
+  captureEmail = false,
+  onSuccess,
   walletConnectProjectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID,
   termsUrl = "",
   privacyUrl = "",
@@ -208,6 +211,54 @@ export default function OrbitCheckout({
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
 
+  // Connection monitoring & offline detection (#310)
+  const [isOnline, setIsOnline] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean'
+      ? navigator.onLine
+      : true;
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      setError((prev) => (prev?.toLowerCase().includes('offline') ? '' : prev));
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Custom Receipt Email Capture (#311)
+  const REMEMBER_EMAIL_KEY = 'orbit:remembered-email';
+  const [customerEmail, setCustomerEmail] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return localStorage.getItem(REMEMBER_EMAIL_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [rememberEmail, setRememberEmail] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return !!localStorage.getItem(REMEMBER_EMAIL_KEY);
+    } catch {
+      return false;
+    }
+  });
+  const [emailError, setEmailError] = useState('');
   useEffect(() => () => handoverWatcher.current?.stop(), []);
 
   useEffect(() => {
@@ -323,6 +374,7 @@ export default function OrbitCheckout({
       });
     } else if (type === "orbit:close") {
       checkoutBridge.current?.send({ type: CHECKOUT_EVENTS.closed });
+    }
     if (typeof window === 'undefined') return;
     const normalizedType = type === 'orbit:subscribed' ? 'orbit:success' : type;
     window.dispatchEvent(new CustomEvent(normalizedType, {
@@ -391,36 +443,21 @@ export default function OrbitCheckout({
     }
   };
 
-  // USDC plans quote raw 7-decimal token units; fiat plans quote major units directly.
-  const formatPlanAmount = (amount, currency) =>
-    (currency === "USDC" ? Number(amount) / 10000000 : Number(amount)).toFixed(
-      2,
-    );
-
+  // #299: validation reports a specific reason (invalid, expired, used up, not
+  // applicable) and leaves the typed code in place so it can be corrected.
   const applyCoupon = async () => {
     const code = couponCode.trim();
     if (!code) return;
     setCouponApplying(true);
     setCouponError("");
-    try {
-      const response = await fetch(`${apiUrl}/coupons/validate`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ plan_id: plan.id || planId, code }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || !payload.valid) {
-        throw new Error(
-          payload.error || "This coupon code is not valid for this plan.",
-        );
-      }
-      setAppliedCoupon(payload);
-    } catch (reason) {
+    const result = await validatePromoCode({ apiUrl, planId: plan.id || planId, code });
+    if (result.ok) {
+      setAppliedCoupon(result.quote);
+    } else {
       setAppliedCoupon(null);
-      setCouponError(reason.message || "Could not validate this coupon code.");
-    } finally {
-      setCouponApplying(false);
+      setCouponError(result.message);
     }
+    setCouponApplying(false);
   };
 
   const removeCoupon = () => {
@@ -792,6 +829,10 @@ export default function OrbitCheckout({
         isNew,
       });
     } catch (reason) {
+      const message = reason?.message || 'Passkey authentication failed or was cancelled.';
+      setError(message);
+      setShowWallets(true);
+      dispatch('orbit:error', { message });
       const message =
         reason?.message || "Biometric passkey authentication failed.";
       setError(message);
@@ -1107,7 +1148,34 @@ export default function OrbitCheckout({
   };
 
   const subscribe = async () => {
+    if (!isOnline) {
+      setError('You are currently offline. Please reconnect to the internet to complete your subscription.');
+      return;
+    }
     if (!validateForm()) return;
+
+    if (captureEmail) {
+      const trimmed = (customerEmail || '').trim();
+      if (!trimmed) {
+        setEmailError('Please enter your email address for your subscription receipt.');
+        return;
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+        setEmailError('Please enter a valid email address.');
+        return;
+      }
+      setEmailError('');
+      if (rememberEmail) {
+        try {
+          localStorage.setItem(REMEMBER_EMAIL_KEY, trimmed);
+        } catch {}
+      } else {
+        try {
+          localStorage.removeItem(REMEMBER_EMAIL_KEY);
+        } catch {}
+      }
+    }
+
     if (!consentSatisfied) {
       setError(
         "Please agree to the Terms of Service and billing authorization before subscribing.",
@@ -1138,6 +1206,18 @@ export default function OrbitCheckout({
         return;
       }
 
+      const activeWallet = passkeyAdapter || StellarWalletsKit;
+      const preflight = await preflightPlan({
+        wallet: activeWallet,
+        address,
+        merchantAddress: plan.merchants.wallet_address,
+        amount: plan.usdc_amount,
+        intervalSeconds: plan.interval_seconds,
+        orbitContractId,
+        tokenContractId,
+        rpcUrl,
+        networkPassphrase,
+      });
       if (!isSwap) {
         const current = await checkUsdcReadiness({ horizonUrl, address, asset: planCurrency, amount: plan.usdc_amount });
         setUsdcReadiness(current);
@@ -1155,6 +1235,8 @@ export default function OrbitCheckout({
       }
 
       const activeWallet = passkeyAdapter || StellarWalletsKit;
+      // #299: with a promo, the vault and allowance follow the discounted schedule
+      const authTerms = promoAuthorization(plan, appliedCoupon);
       setConfirming(true);
       setConfirmingSeconds(60);
 
@@ -1166,13 +1248,13 @@ export default function OrbitCheckout({
             wallet: activeWallet,
             address,
             merchantAddress: plan.merchants.wallet_address,
-            amount: plan.usdc_amount,
+            amount: authTerms.amount,
             intervalSeconds: plan.interval_seconds,
             orbitContractId,
             settlementTokenContractId: tokenContractId,
             rpcUrl,
             networkPassphrase,
-            billingCycles: 12,
+            billingCycles: authTerms.billingCycles,
             paymentTokenContractId: assetContractId(
               selectedPayWith,
               networkPassphrase,
@@ -1202,8 +1284,9 @@ export default function OrbitCheckout({
           wallet: activeWallet,
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1230,8 +1313,9 @@ export default function OrbitCheckout({
         const preflight = await preflightPlan({
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1242,8 +1326,9 @@ export default function OrbitCheckout({
           wallet: activeWallet,
           address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
+          amount: authTerms.amount,
           intervalSeconds: plan.interval_seconds,
+          billingCycles: authTerms.billingCycles,
           orbitContractId,
           tokenContractId,
           rpcUrl,
@@ -1261,12 +1346,18 @@ export default function OrbitCheckout({
         });
       }
 
+      const finalMetadata = {
+        ...formData,
+        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+      };
+
       const response = await fetch(`${apiUrl}/subscriptions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           plan_id: plan.id || planId,
           customer_wallet_address: address,
+          metadata: finalMetadata,
           metadata: formData,
           coupon_code: appliedCoupon?.code,
         }),
@@ -1295,6 +1386,15 @@ export default function OrbitCheckout({
       localStorage.removeItem(PENDING_KEY);
       setPending(null);
       setReceipt(hashes);
+      const subscriptionEventPayload = {
+        subscriptionId: subscription.id,
+        planId: plan.id || planId,
+        txHash: hashes.vaultHash,
+        metadata: finalMetadata,
+        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+      };
+      dispatch('orbit:subscribed', subscriptionEventPayload);
+      onSuccess?.(subscriptionEventPayload);
       dispatch("orbit:subscribed", {
         vaultId: subscription.vault_id || subscription.vaultId || subscription.id,
         subscriptionId: subscription.id,
@@ -1374,13 +1474,15 @@ export default function OrbitCheckout({
     1,
     Math.round(Number(plan.interval_seconds) / 86400),
   );
-  const couponDiscountPct = appliedCoupon
-    ? Math.round(
-        (Number(appliedCoupon.savings) /
-          Number(appliedCoupon.original_amount)) *
-          100,
-      )
-    : 0;
+  // #299: badge text and the allowance the subscriber is about to sign
+  const promoTerms = appliedCoupon ? formatPromoTerms(appliedCoupon) : null;
+  let promoAllowanceUsdc = null;
+  try {
+    const terms = appliedCoupon ? promoAuthorization(plan, appliedCoupon) : null;
+    if (terms) promoAllowanceUsdc = { total: (Number(terms.allowance) / 10000000).toFixed(2), cycles: terms.billingCycles };
+  } catch {
+    promoAllowanceUsdc = null;
+  }
 
   return (
     <section
@@ -1440,26 +1542,24 @@ export default function OrbitCheckout({
         <h2>{plan.name}</h2>
       </div>
 
-      {appliedCoupon ? (
-        <p style={styles.price}>
-          <span className="orbit-price-original">
-            $
-            {formatPlanAmount(
-              appliedCoupon.original_amount,
-              appliedCoupon.currency,
-            )}{" "}
-            {appliedCoupon.currency}
-          </span>
-          $
-          {formatPlanAmount(
-            appliedCoupon.discounted_amount,
-            appliedCoupon.currency,
-          )}{" "}
-          {appliedCoupon.currency}
-          <span className="orbit-discount-pill">
-            {couponDiscountPct}% OFF applied
-          </span>
-        </p>
+      {promoTerms ? (
+        <>
+          <p style={styles.price} aria-label={`${promoTerms.original} ${promoTerms.currency} reduced to ${promoTerms.discounted} ${promoTerms.currency} ${promoTerms.period}`}>
+            <s className="orbit-price-original">
+              {promoTerms.original} {promoTerms.currency}
+            </s>{" "}
+            {promoTerms.discounted} {promoTerms.currency}
+            <span className="orbit-discount-pill">
+              {promoTerms.badge} {promoTerms.period}
+            </span>
+          </p>
+          <p style={{ fontSize: 13, margin: "4px 0 0", color: "var(--orbit-muted, #6b7280)" }}>
+            Then {promoTerms.original} {promoTerms.currency} per cycle. You will be asked to approve the regular price when the promotion ends.
+            {promoAllowanceUsdc && (
+              <> This authorization allows up to {promoAllowanceUsdc.total} USDC over {promoAllowanceUsdc.cycles} {promoAllowanceUsdc.cycles === 1 ? "cycle" : "cycles"}.</>
+            )}
+          </p>
+        </>
       ) : (
         <p style={styles.price}>${planAmountUsdc} USDC</p>
       )}
@@ -1474,16 +1574,13 @@ export default function OrbitCheckout({
               className="orbit-coupon-toggle"
               onClick={() => setCouponOpen(true)}
             >
-              Have a coupon code?
+              Have a promo code?
             </button>
           )}
           {appliedCoupon && (
             <p style={{ fontSize: 13, color: "var(--orbit-text)", margin: 0 }}>
-              Coupon <strong>{appliedCoupon.code}</strong> applied
-              {appliedCoupon.duration_months > 1
-                ? ` for ${appliedCoupon.duration_months} months`
-                : ""}
-              .{" "}
+              Promo <strong>{appliedCoupon.code}</strong> applied{" "}
+              {promoTerms?.period}.{" "}
               <button
                 type="button"
                 className="orbit-coupon-toggle"
@@ -1497,8 +1594,10 @@ export default function OrbitCheckout({
             <div className="orbit-coupon-row">
               <input
                 type="text"
-                placeholder="Coupon code"
-                aria-label="Coupon code"
+                placeholder="Promo code"
+                aria-label="Promo code"
+                aria-invalid={couponError ? "true" : "false"}
+                aria-describedby={couponError ? "orbit-promo-error" : undefined}
                 value={couponCode}
                 onChange={(e) => {
                   setCouponCode(e.target.value);
@@ -1533,7 +1632,7 @@ export default function OrbitCheckout({
             </div>
           )}
           {couponError && (
-            <div className="orbit-field-error" role="alert">
+            <div id="orbit-promo-error" className="orbit-field-error" role="alert">
               {couponError}
             </div>
           )}
@@ -1772,6 +1871,62 @@ export default function OrbitCheckout({
         </div>
       )}
 
+      {/* Custom Receipt Email Capture (#311) */}
+      {captureEmail && !receipt && (
+        <div className="orbit-field" style={{ marginTop: 16, marginBottom: 16 }}>
+          <label htmlFor="orbit-receipt-email">
+            Receipt Email Address <span style={{ color: 'var(--orbit-error)' }}>*</span>
+          </label>
+          <input
+            id="orbit-receipt-email"
+            type="email"
+            placeholder="you@example.com"
+            value={customerEmail}
+            onChange={(e) => {
+              setCustomerEmail(e.target.value);
+              if (emailError) setEmailError('');
+            }}
+            disabled={processing || confirming || !isOnline}
+            autoComplete="email"
+          />
+          {emailError && (
+            <div className="orbit-field-error" role="alert">
+              {emailError}
+            </div>
+          )}
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px', fontSize: '12px', color: 'var(--orbit-muted)', cursor: 'pointer', fontWeight: 'normal' }}>
+            <input
+              type="checkbox"
+              checked={rememberEmail}
+              onChange={(e) => setRememberEmail(e.target.checked)}
+              disabled={processing || confirming}
+              style={{ width: 'auto', margin: 0 }}
+            />
+            Remember my email for future checkouts
+          </label>
+        </div>
+      )}
+
+      {/* Offline Warning Banner (#310) */}
+      {!isOnline && (
+        <div role="alert" className="orbit-offline-banner" style={{
+          margin: '16px 0',
+          padding: '12px 14px',
+          border: '1px solid #ef4444',
+          borderRadius: 'var(--orbit-radius)',
+          background: actualTheme === 'dark' ? 'rgba(239, 68, 68, 0.15)' : '#fef2f2',
+          color: actualTheme === 'dark' ? '#fca5a5' : '#991b1b',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+            <strong style={{ fontSize: '13px' }}>Network Connection Unavailable</strong>
+          </div>
+          <p style={{ margin: 0, fontSize: '12px', lineHeight: 1.4 }}>
+            You are currently offline. Authorization cannot proceed until internet connectivity is restored.
+          </p>
+        </div>
+      )}
+
       {/* Wrong Network Warning Banner */}
       {isWrongNetwork && (
         <div role="alert" className="orbit-wrong-network">
@@ -1992,6 +2147,8 @@ export default function OrbitCheckout({
             )}
             <button
               className={customClasses.button}
+              style={{ ...styles.button, opacity: (isWrongNetwork || !isOnline) ? 0.6 : 1 }}
+              disabled={processing || isWrongNetwork || !isOnline}
               style={{
                 ...styles.button,
                 opacity: isWrongNetwork || !consentSatisfied ? 0.6 : 1,
@@ -2006,6 +2163,17 @@ export default function OrbitCheckout({
               onClick={subscribe}
               title={!isSwap && !isDemo ? (usdcCheckError || usdcReadinessMessage(usdcReadiness) || undefined) : undefined}
             >
+              {!isOnline
+                ? 'Network Connection Unavailable'
+                : processing
+                ? 'Preparing transaction...'
+                : isWrongNetwork
+                ? `Switch to ${targetNetworkName} to continue`
+                : isDemo
+                ? 'Preview success state'
+                : passkeyAdapter
+                ? 'Sign with Passkey'
+                : 'Authorize Subscription'}
               {processing
                 ? "Preparing transaction..."
                 : !consentSatisfied
@@ -2026,6 +2194,14 @@ export default function OrbitCheckout({
             </button>
           </>
         ) : (
+          <button
+            className={customClasses.button}
+            style={{ ...styles.button, opacity: !isOnline ? 0.6 : 1 }}
+            disabled={!isOnline}
+            onClick={handleOpenWallets}
+          >
+            {!isOnline ? 'Network Connection Unavailable' : 'Connect wallet'}
+          </button>
           <div>
             <button
               className={customClasses.button}
@@ -2162,7 +2338,7 @@ export default function OrbitCheckout({
             </button>
           )}
 
-          {/* Biometric Passkey Option */}
+          {/* Biometric Passkey Option (#309) */}
           {hasPasskey && (
             <button
               style={{
@@ -2174,6 +2350,10 @@ export default function OrbitCheckout({
               disabled={!consentSatisfied}
               onClick={connectPasskey}
             >
+              <div style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span>🔑 Sign with Passkey</span>
+              </div>
+              <small style={{ color: 'var(--orbit-muted)' }}>1-touch biometric authorization (Touch ID, Face ID, Windows Hello)</small>
               <div
                 style={{
                   fontWeight: 700,
