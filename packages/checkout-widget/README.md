@@ -67,13 +67,36 @@ The allowance covers 12 billing cycles and expires after those cycles plus a led
 
 Before signatures, the widget simulates the USDC `approve` and Orbit `create_vault` transactions, reads USDC/XLM balances, and displays estimated fees. In-flight hashes are backed up in local storage and can be checked again after a refresh or a long network delay.
 
-## Coupon codes (#222)
+## Promo codes (#222, #299)
 
-A collapsible "Have a coupon code?" link reveals a code input and an Apply button. Applying calls the public `POST /coupons/validate` endpoint (`{ plan_id, code }`, no API key required) and, on a `{ valid: true, ... }` response, replaces the price with a struck-through original amount, the discounted amount, and a "N% OFF applied" pill computed from the returned `savings`/`original_amount`. The validated, server-normalized `code` is sent back as `coupon_code` in the `POST /subscriptions` payload, which the backend redeems atomically via `redeem_coupon_subscription` (see `apps/backend/coupons.js`).
+A collapsible "Have a promo code?" link reveals a code input and an Apply button. Applying calls the public `POST /api/promo/validate` endpoint (`{ plan_id, code }`, no API key required; `POST /coupons/validate` is the same check). The logic lives in `src/promo.js` and is unit-tested in `test/promo.test.js`.
 
-**This discounts the checkout price quote and the subscription record only.** The backend marks these subscriptions `pending_promo` with `promotion_onchain_verified: false` - the Stellar vault `approve`/`create_vault` transactions the widget asks the customer to sign still authorize the plan's full on-chain amount (`plan.usdc_amount`), because the current contract has no compatible promo-vault terms (`onchain_enforcement: 'requires-compatible-vault'` in the validate response). Do not wire `appliedCoupon.discounted_amount` into `soroban.js`'s `authorizePlan`/`preflightPlan` calls without first confirming the deployed contract actually enforces it - otherwise the signed authorization would silently diverge from what's displayed.
+**Errors stay specific and keep the form.** The API returns a `reason` for every refusal, and the widget shows a matching message under the input without clearing what was typed:
 
-A coupon is cleared automatically if the selected plan changes (switching presets, a fresh `planId`/`planData`), since a code validated for one plan is not valid for another.
+| `reason` | Message |
+|---|---|
+| `invalid` | This promo code is not valid. |
+| `expired` | This promo code has expired. |
+| `exhausted` | This promo code has reached its redemption limit. |
+| `not_applicable` | This promo code cannot be applied to this plan. |
+| `network` | Could not check this promo code. Check your connection and try again. |
+
+A malformed code is rejected before any request. A quote whose `expires_at` has already passed is refused locally, even if the server accepted it.
+
+**Price display.** A valid code strikes through the regular price and shows the discounted price, with a badge such as `-50% for the first 3 months`. Below that, a note shows the regular price that follows and the exact allowance the subscriber is about to approve.
+
+**Authorization matches the discounted schedule.** An Orbit vault pulls exactly `amount_per_interval` every cycle, so a single vault cannot charge a discounted price and then the regular one. With a promo, `promoAuthorization()` therefore:
+
+- creates the vault at the discounted per-cycle amount, and
+- authorizes only the promotional cycles: the promo's `duration_months` converted to the plan interval, at least one.
+
+The `approve` allowance the subscriber signs in Freighter is exactly `discounted amount × promotional cycles`. For example, 20 USDC → 10 USDC for 3 monthly cycles authorizes 30 USDC, not 240. Fiat-priced plans discount their USDC amount proportionally. Without a promo, nothing changes: the plan amount for 12 cycles. All three paths use these parameters: standard, smart-wallet/atomic, and swap.
+
+When the promotion ends, the allowance is used up, so the next pull asks the subscriber to approve the regular price through the existing recovery/re-authorization flow. The widget states this before they sign. The authorization they sign therefore never exceeds what the checkout displays.
+
+The validated, server-normalized `code` is sent back as `coupon_code` in the `POST /subscriptions` payload, which the backend redeems atomically via `redeem_coupon_subscription` (see `apps/backend/coupons.js`).
+
+A promo code is cleared automatically if the selected plan changes (switching presets, a fresh `planId`/`planData`), since a code validated for one plan is not valid for another.
 
 ## Lifecycle events
 

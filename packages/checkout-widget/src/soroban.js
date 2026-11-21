@@ -79,6 +79,7 @@ const buildPlanTransactions = ({ account, address, merchantAddress, amount, inte
   return { approve, createVault };
 };
 
+export async function preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
 /**
  * Builds an atomic batch transaction bundling token trustline (if needed), allowance approval,
  * and vault creation into a single transaction invocation (#169).
@@ -145,7 +146,9 @@ export const buildAtomicPlanTransaction = ({
 };
 
 /**
- * Submits a transaction through the backend gas relayer for fee sponsorship (#169).
+ * Submits a transaction through the backend gas relayer for fee sponsorship (#169, #297).
+ * The relayer only sponsors vault-creation transactions that pass its policy; anything it
+ * refuses falls back to direct submission, paid by the subscriber.
  */
 export async function submitSponsoredTransaction({
   server,
@@ -155,11 +158,11 @@ export async function submitSponsoredTransaction({
 }) {
   if (apiUrl) {
     try {
-      const res = await fetch(`${apiUrl}/relay/sponsor-transaction`, {
+      const res = await fetch(`${apiUrl}/api/relayer/sponsor`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tx_xdr: transaction.toXDR(),
+          signed_tx_xdr: transaction.toXDR(),
           network_passphrase: networkPassphrase,
         }),
       });
@@ -187,6 +190,9 @@ export async function submitSponsoredTransaction({
 export async function preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000, baseFee = BASE_FEE }) {
   if (!orbitContractId || !tokenContractId) throw new Error('Missing Orbit or token contract configuration.');
   const server = new rpc.Server(rpcUrl);
+  if (wallet?.ensureAccountDeployed) {
+    await wallet.ensureAccountDeployed(server, rpcUrl);
+  }
   const account = await server.getAccount(address);
   const ledger = await server.getLatestLedger();
   const transactions = buildPlanTransactions({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: ledger.sequence, billingCycles, baseFee });
@@ -294,6 +300,7 @@ export async function authorizePlan({
   onProgress,
 }) {
   const details = preflight || await preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles, baseFee });
+  const details = preflight || await preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles });
   const { server, transactions } = details;
   const approvalHash = await signAndSubmit({ server, transaction: transactions.approve, wallet, address, networkPassphrase, stage: 'approval', onSubmitted, onProgress });
 

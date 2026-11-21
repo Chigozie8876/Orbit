@@ -80,7 +80,7 @@ stellar contract invoke \
   --live_until_ledger 5000000
 
 # Now Alice calls batch_disburse. We pass a JSON array for the splits.
-# splits: [{"recipient": "charlie_address", "amount": "100000000"}]
+# splits: [{"recipient": "charlie_address", "amount": "100000000", "token": "<usdc_contract_id>"}]
 stellar contract invoke \
   --id $ORBIT_CONTRACT \
   --source alice \
@@ -89,6 +89,6 @@ stellar contract invoke \
   batch_disburse \
   --sender $ALICE_ADDRESS \
   --token $USDC_CONTRACT \
-  --splits "[{\"recipient\": \"$CHARLIE_ADDRESS\", \"amount\": \"100000000\"}]"
+  --splits "[{\"recipient\": \"$CHARLIE_ADDRESS\", \"amount\": \"100000000\", \"token\": \"$USDC_CONTRACT\"}]"
 
 echo "End-to-End Test Flow Completed Successfully!"

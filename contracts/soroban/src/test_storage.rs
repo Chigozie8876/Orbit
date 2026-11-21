@@ -372,13 +372,14 @@ fn test_vault_lifecycle_keeps_one_persistent_entry_and_no_temporary_state() {
 
     f.client
         .create_vault(&f.user, &merchant, &f.token_address, &AMOUNT, &INTERVAL);
-    assert_eq!(storage_counts(&f.env, &f.contract_id), (4, 0, 0));
+    // One vault entry plus its #300 schema marker.
+    assert_eq!(storage_counts(&f.env, &f.contract_id), (5, 0, 0));
 
     f.env.ledger().set_timestamp(1000);
     f.client.pull_funds(&f.user, &merchant);
 
     // The pull updates the vault and existing credential entries in place.
-    assert_eq!(storage_counts(&f.env, &f.contract_id), (4, 0, 0));
+    assert_eq!(storage_counts(&f.env, &f.contract_id), (5, 0, 0));
 }
 
 #[test]
@@ -421,12 +422,13 @@ fn test_cancel_vault_leaves_zero_keys_in_any_storage_tier() {
         .create_vault(&f.user, &merchant, &f.token_address, &AMOUNT, &INTERVAL);
     f.env.ledger().set_timestamp(1000);
     f.client.pull_funds(&f.user, &merchant);
-    assert_eq!(storage_counts(&f.env, &f.contract_id), (4, 0, 0));
+    assert_eq!(storage_counts(&f.env, &f.contract_id), (5, 0, 0));
 
     f.client.cancel_vault(&f.user, &merchant);
 
     // Badge identity, next-id and bitmap entries remain for stable subscriber
-    // identity and are marked inactive by cancellation.
+    // identity and are marked inactive by cancellation. The vault entry and its
+    // schema marker are both removed.
     assert_eq!(storage_counts(&f.env, &f.contract_id), (3, 0, 0));
 }
 
@@ -440,11 +442,11 @@ fn test_cancel_vault_only_removes_that_vault() {
         .create_vault(&f.user, &merchant_a, &f.token_address, &AMOUNT, &INTERVAL);
     f.client
         .create_vault(&f.user, &merchant_b, &f.token_address, &AMOUNT, &INTERVAL);
-    assert_eq!(storage_counts(&f.env, &f.contract_id), (8, 0, 0));
+    assert_eq!(storage_counts(&f.env, &f.contract_id), (10, 0, 0));
 
     f.client.cancel_vault(&f.user, &merchant_a);
 
-    assert_eq!(storage_counts(&f.env, &f.contract_id), (7, 0, 0));
+    assert_eq!(storage_counts(&f.env, &f.contract_id), (8, 0, 0));
     let (gone, kept) = f.env.as_contract(&f.contract_id, || {
         (
             f.env
@@ -469,7 +471,7 @@ fn test_recreating_a_cancelled_vault_reuses_a_single_entry() {
     for _ in 0..3 {
         f.client
             .create_vault(&f.user, &merchant, &f.token_address, &AMOUNT, &INTERVAL);
-        assert_eq!(storage_counts(&f.env, &f.contract_id), (4, 0, 0));
+        assert_eq!(storage_counts(&f.env, &f.contract_id), (5, 0, 0));
         f.client.cancel_vault(&f.user, &merchant);
         assert_eq!(storage_counts(&f.env, &f.contract_id), (3, 0, 0));
     }
@@ -499,6 +501,9 @@ fn test_compact_layout_round_trips_vault_data() {
             is_paused: false,
             trial_end_timestamp: 0,
             setup_fee: 0,
+            expiration_ledger: 0,
+            lifetime_cap_amount: -1,
+            total_pulled_amount: AMOUNT,
         })
     );
     let vault = f.client.get_vault(&f.user, &merchant).unwrap();

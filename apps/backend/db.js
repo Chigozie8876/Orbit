@@ -21,6 +21,13 @@ class DatabaseManager {
 
         this.databaseUrl = options.databaseUrl || process.env.DATABASE_URL;
         this.databaseReplicaUrls = options.databaseReplicaUrls || this.parseReplicaUrls(process.env.DATABASE_REPLICA_URLS || process.env.DATABASE_READ_REPLICA_URL);
+        this.poolOptions = {
+            max: Number(process.env.DB_POOL_MAX) || 20,
+            idleTimeoutMillis: Number(process.env.DB_POOL_IDLE_TIMEOUT_MS) || 30000,
+            connectionTimeoutMillis: Number(process.env.DB_POOL_CONNECTION_TIMEOUT_MS) || 5000,
+            maxUses: Number(process.env.DB_POOL_MAX_USES) || 7500,
+            ...options.poolOptions,
+        };
 
         // Primary client
         this.primaryClient = null;
@@ -132,14 +139,14 @@ class DatabaseManager {
 
         if (readOnly && this.databaseReplicaUrls.length > 0) {
             if (this.replicaPools.length === 0) {
-                this.replicaPools = this.databaseReplicaUrls.map((connStr) => new Pool({ connectionString: connStr, max: 5 }));
+                this.replicaPools = this.databaseReplicaUrls.map((connStr) => new Pool({ connectionString: connStr, ...this.poolOptions }));
             }
             return this.replicaPools[0];
         }
 
         if (!this.databaseUrl) return null;
         if (!this.primaryPool) {
-            this.primaryPool = new Pool({ connectionString: this.databaseUrl, max: 5 });
+            this.primaryPool = new Pool({ connectionString: this.databaseUrl, ...this.poolOptions });
         }
         return this.primaryPool;
     }

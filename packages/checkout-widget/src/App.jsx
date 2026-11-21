@@ -31,6 +31,7 @@ function App() {
   const [theme, setTheme] = useState('dark');
   const [accentColor, setAccentColor] = useState('#6366f1');
   const [borderRadius, setBorderRadius] = useState('md');
+  const [captureEmail, setCaptureEmail] = useState(true);
 
   const activePlan = PRESET_PLANS[selectedPlanIndex];
 
@@ -119,6 +120,10 @@ function App() {
         <label>Theme <select value={theme} onChange={(event) => setTheme(event.target.value)}><option value="dark">Dark</option><option value="light">Light</option><option value="auto">Auto</option></select></label>
         <label>Accent <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value)} /></label>
         <label>Radius <select value={borderRadius} onChange={(event) => setBorderRadius(event.target.value)}><option value="none">None</option><option value="sm">Small</option><option value="md">Medium</option><option value="lg">Large</option><option value="full">Full</option></select></label>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+          <input type="checkbox" checked={captureEmail} onChange={(e) => setCaptureEmail(e.target.checked)} />
+          Capture Email
+        </label>
       </div>
       {showWidget && (
         <div style={{
@@ -127,7 +132,7 @@ function App() {
           background: 'linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%)',
           boxShadow: '0 20px 50px rgba(0,0,0,0.6)'
         }}>
-          <OrbitCheckout planId={activePlan.id} planData={activePlan} demo theme={theme} accentColor={accentColor} borderRadius={borderRadius} allowedOrigins={[window.location.origin]} />
+          <OrbitCheckout planId={activePlan.id} planData={activePlan} demo theme={theme} accentColor={accentColor} borderRadius={borderRadius} captureEmail={captureEmail} allowedOrigins={[window.location.origin]} />
         </div>
       )}
 

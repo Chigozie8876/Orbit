@@ -116,7 +116,7 @@ describe('Webhook System', () => {
         expect.objectContaining({
           headers: expect.objectContaining({
             'Content-Type': 'application/json',
-            'X-Orbit-Signature': expect.stringMatching(/^t=\d+,v1=[a-f0-9]{64}$/),
+            'X-Orbit-Signature': expect.stringMatching(/^t=\d+,n=[0-9a-f-]{36},v1=[a-f0-9]{64}$/),
           }),
         })
       );
@@ -216,7 +216,7 @@ describe('Webhook System', () => {
       expect(callUrl).toBe(mockWebhook.url);
       expect(callOptions.headers['X-Orbit-Replay']).toBe('true');
       expect(callOptions.headers['X-Orbit-Event']).toBe('payment.settled');
-      expect(callOptions.headers['X-Orbit-Signature']).toMatch(/^t=\d+,v1=[a-f0-9]{64}$/);
+      expect(callOptions.headers['X-Orbit-Signature']).toMatch(/^t=\d+,n=[0-9a-f-]{36},v1=[a-f0-9]{64}$/);
 
       // Verify HMAC signature validity
       const payloadString = callOptions.body;
@@ -349,13 +349,14 @@ describe('Webhook System', () => {
     const at = 1_800_000_000;
     const now = () => at * 1000;
 
-    it('signs "<t>.<body>" and sends it as t=<timestamp>,v1=<hash>', () => {
-      const { header, timestamp, v1 } = signWebhookPayload(secret, body, at);
+    it('signs "<t>.<nonce>.<body>" and carries the nonce in the signature header', () => {
+      const nonce = '11111111-2222-4333-8444-555555555555';
+      const { header, timestamp, v1 } = signWebhookPayload(secret, body, at, nonce);
       expect(timestamp).toBe(at);
-      expect(header).toBe(`t=${at},v1=${v1}`);
-      const expected = createHmac('sha256', secret).update(`${at}.${body}`).digest('hex');
+      expect(header).toBe(`t=${at},n=${nonce},v1=${v1}`);
+      const expected = createHmac('sha256', secret).update(`${at}.${nonce}.${body}`).digest('hex');
       expect(v1).toBe(expected);
-      expect(parseSignatureHeader(header)).toEqual({ timestamp: at, signatures: [expected] });
+      expect(parseSignatureHeader(header)).toEqual({ timestamp: at, nonce, signatures: [expected] });
     });
 
     it('verifies a fresh signature and rejects tampering, wrong secrets and malformed headers', () => {

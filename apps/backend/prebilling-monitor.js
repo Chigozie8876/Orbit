@@ -46,6 +46,33 @@ const checkOnChainLiquidity = async (chain, { subscriber, tokenAddress, spender,
   return evaluateLiquidity({ balance, allowance, requiredAmount });
 };
 
+/**
+ * Stores the latest liquidity check on the subscription (#298) so the merchant
+ * dashboard can score subscriber health from real on-chain balance and
+ * allowance, not only from failed pulls. Amounts stay in raw token units, as
+ * strings. A failed write is logged and does not stop the scan.
+ */
+const recordLiquiditySnapshot = async (supabase, sub, risk, now) => {
+  const liquidity = {
+    balance: risk.balance,
+    allowance: risk.allowance,
+    required_amount: risk.requiredAmount,
+    low_balance: risk.lowBalance,
+    allowance_expiring: risk.allowanceExpiring,
+    checked_at: now.toISOString(),
+  };
+  try {
+    const { error } = await supabase
+      .from('subscriptions')
+      .update({ metadata: { ...(sub.metadata || {}), liquidity } })
+      .eq('id', sub.id);
+    if (error) throw error;
+  } catch (err) {
+    console.warn(`Pre-billing monitor could not record liquidity for ${sub.id}:`, err?.message || err);
+  }
+  return liquidity;
+};
+
 const warningPayload = ({ sub, risk, link, merchantId }) => {
   const event = risk.allowanceExpiring && !risk.lowBalance ? 'subscription.allowance_expiring' : 'subscription.low_balance_warning';
   return {
@@ -99,6 +126,7 @@ const runPreBillingScan = async (supabase, {
       spender: chain.spender,
       requiredAmount,
     });
+    await recordLiquiditySnapshot(supabase, sub, risk, now);
 
     if (!risk.lowBalance && !risk.allowanceExpiring) continue;
 
@@ -136,6 +164,7 @@ module.exports = {
   scanUpcomingRenewals,
   evaluateLiquidity,
   checkOnChainLiquidity,
+  recordLiquiditySnapshot,
   runPreBillingScan,
   startPreBillingMonitor,
 };
