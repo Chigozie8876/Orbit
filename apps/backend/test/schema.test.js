@@ -294,6 +294,67 @@ describe('Migration runner and schema versioning guard (#157)', () => {
     expect(await migrateUp(db)).toHaveLength(shipped.length);
   });
 
+  it('claims a recurring pull once and atomically settles its subscription cycle', async () => {
+    await db.exec(fs.readFileSync(path.resolve(__dirname, '../schema.sql'), 'utf8'));
+    await migrateUp(db);
+
+    const merchantId = '00000000-0000-4000-8000-000000000001';
+    const planId = '00000000-0000-4000-8000-000000000002';
+    const subscriptionId = '00000000-0000-4000-8000-000000000003';
+    const leaseToken = '00000000-0000-4000-8000-000000000004';
+    const competingToken = '00000000-0000-4000-8000-000000000005';
+    const vaultId = 'a'.repeat(64);
+    const billingCycle = '2026-01-01T00:00:00.000Z';
+
+    await db.query(
+      'INSERT INTO merchants (id, wallet_address, name) VALUES ($1, $2, $3)',
+      [merchantId, 'Gmerchant', 'Merchant'],
+    );
+    await db.query(
+      'INSERT INTO plans (id, merchant_id, name, usdc_amount, interval_seconds) VALUES ($1, $2, $3, $4, $5)',
+      [planId, merchantId, 'Plan', 100, 3600],
+    );
+    await db.query(
+      `INSERT INTO subscriptions (id, plan_id, customer_wallet_address, next_billing_date)
+       VALUES ($1, $2, $3, $4)`,
+      [subscriptionId, planId, 'Gsubscriber', billingCycle],
+    );
+
+    const claim = await db.query(
+      'SELECT * FROM claim_recurring_pull_cycle($1, $2, $3, $4, $5)',
+      [vaultId, billingCycle, subscriptionId, leaseToken, 60],
+    );
+    expect(claim.rows[0]).toMatchObject({ claimed: true, attempt_count: 1 });
+
+    const competingClaim = await db.query(
+      'SELECT * FROM claim_recurring_pull_cycle($1, $2, $3, $4, $5)',
+      [vaultId, billingCycle, subscriptionId, competingToken, 60],
+    );
+    expect(competingClaim.rows[0].claimed).toBe(false);
+
+    const settledAt = '2026-01-01T00:01:00.000Z';
+    const nextBillingDate = '2026-01-01T01:01:00.000Z';
+    const settlement = await db.query(
+      `SELECT settle_recurring_pull_cycle($1, $2, $3, $4, $5, $6) AS settled`,
+      [vaultId, billingCycle, leaseToken, 'b'.repeat(64), settledAt, nextBillingDate],
+    );
+    expect(settlement.rows[0].settled).toBe(true);
+
+    const subscription = await db.query(
+      'SELECT status, next_billing_date, retry_count FROM subscriptions WHERE id = $1',
+      [subscriptionId],
+    );
+    expect(subscription.rows[0].status).toBe('active');
+    expect(new Date(subscription.rows[0].next_billing_date).toISOString()).toBe(nextBillingDate);
+    expect(subscription.rows[0].retry_count).toBe(0);
+
+    const replay = await db.query(
+      'SELECT * FROM claim_recurring_pull_cycle($1, $2, $3, $4, $5)',
+      [vaultId, billingCycle, subscriptionId, competingToken, 60],
+    );
+    expect(replay.rows[0].claimed).toBe(false);
+  });
+
   it('skips the startup guard when no database URL is configured', async () => {
     const warnings = [];
     await expect(checkSchemaOnStartup({ databaseUrl: '', logger: { warn: (m) => warnings.push(m) } })).resolves.toBeNull();

@@ -268,7 +268,7 @@ const createRelayer = ({
     };
 
     // Submits the pull as a sponsored fee bump and waits for confirmation via `confirm(server, hash)`
-    const relayPull = async ({ merchantId, entry, user, merchant, confirm }) => {
+    const relayPull = async ({ merchantId, entry, user, merchant, confirm, onSubmitted }) => {
         const channel = await pool.acquire();
         let reservation = null;
         let submitted = null;
@@ -316,6 +316,7 @@ const createRelayer = ({
                 if (response.status === 'PENDING' || response.status === 'DUPLICATE') {
                     sequences.commit(channel.publicKey(), prepared.sequence);
                     submitted = { hash: response.hash, attempts: attempt, innerTransaction: prepared, fee };
+                    if (onSubmitted) await onSubmitted({ txHash: submitted.hash, attempts: attempt });
                     break;
                 }
 

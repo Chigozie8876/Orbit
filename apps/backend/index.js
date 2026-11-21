@@ -88,6 +88,12 @@ const { registerPaymentLinkRoutes } = require('./payment-links');
 const { checkSchemaOnStartup } = require('./migrate');
 const { createInvoiceService, registerInvoiceRoutes } = require('./invoices');
 const { registerDevFundingRoutes } = require('./dev-faucet');
+const {
+    createRemoteMerchantSigner,
+    createSupabaseStore: createRecurringPullStore,
+    createRecurringPullWorker,
+    startRecurringPullWorker,
+} = require('./recurring-pulls');
 
 const app = express();
 const feeEstimator = createFeeEstimator({ horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org' });
@@ -550,25 +556,33 @@ const applyPullOutcome = async ({
     server = null,
     signedTx = null,
     extraBody = {},
+    subscriptionAlreadySettled = false,
+    settledAt = null,
+    nextBillingDate = null,
     // Seconds spent waiting for Soroban confirmation, for orbit_pull_duration_seconds (#230)
     confirmationSeconds = null,
 }) => {
     recordPullOutcome(status, confirmationSeconds);
     if (status === "SUCCESS") {
-        const pullTime = new Date();
-        const nextBilling = new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
+        const pullTime = settledAt || new Date();
+        const nextBilling = nextBillingDate
+            ? new Date(nextBillingDate)
+            : new Date(pullTime.getTime() + Number(sub.plans.interval_seconds) * 1000);
 
-        await supabase
-            .from('subscriptions')
-            .update({
-                next_billing_date: nextBilling.toISOString(),
-                status: 'active',
-                retry_count: 0,
-                dunning_status: null,
-                next_dunning_retry_at: null,
-                last_failure: null,
-            })
-            .eq('id', subscription_id);
+        if (!subscriptionAlreadySettled) {
+            const { error: subscriptionUpdateError } = await supabase
+                .from('subscriptions')
+                .update({
+                    next_billing_date: nextBilling.toISOString(),
+                    status: 'active',
+                    retry_count: 0,
+                    dunning_status: null,
+                    next_dunning_retry_at: null,
+                    last_failure: null,
+                })
+                .eq('id', subscription_id);
+            if (subscriptionUpdateError) throw subscriptionUpdateError;
+        }
 
         await writeAuditLog(supabase, {
             merchantId: sub.plans.merchant_id,
@@ -2175,6 +2189,9 @@ function startServer() {
     // Background oracle worker (#96): refreshes the fiat->USDC rate cache on a
     // schedule so /rates and dynamic fiat billing always read fresh quotes.
     const oracleSupabase = getSupabase();
+    if (process.env.RECURRING_PULLS_ENABLED === 'true' && !oracleSupabase) {
+        throw new Error('Supabase must be configured when recurring pulls are enabled');
+    }
     if (oracleSupabase) {
         app.locals.oracleWorker = startOracleWorker({
             supabase: oracleSupabase,
@@ -2203,6 +2220,65 @@ function startServer() {
             app.locals.snapshotExportWorker.start(
                 Number(process.env.SNAPSHOT_EXPORT_INTERVAL_MS) || undefined,
             );
+        }
+
+        if (process.env.RECURRING_PULLS_ENABLED === 'true') {
+            const contractId = process.env.ORBIT_CONTRACT_ID;
+            if (!contractId) throw new Error('ORBIT_CONTRACT_ID is required when recurring pulls are enabled');
+            const relayer = getRelayer();
+            if (!relayer) throw new Error('RELAYER_SECRET_KEY is required when recurring pulls are enabled');
+            const signer = createRemoteMerchantSigner({
+                url: process.env.RECURRING_PULL_SIGNER_URL,
+                token: process.env.RECURRING_PULL_SIGNER_TOKEN,
+                fetchImpl: app.locals.fetchImpl,
+            });
+            const recurringPullOptions = {};
+            if (process.env.RECURRING_PULL_MAX_ATTEMPTS) {
+                const maxAttempts = Number(process.env.RECURRING_PULL_MAX_ATTEMPTS);
+                if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+                    throw new Error('RECURRING_PULL_MAX_ATTEMPTS must be a positive integer');
+                }
+                recurringPullOptions.maxAttempts = maxAttempts;
+            }
+            const recurringPullWorker = createRecurringPullWorker({
+                store: createRecurringPullStore(oracleSupabase),
+                relayer,
+                signer,
+                contractId,
+                networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+                waitForTransaction: (hash, options) => waitForTransaction(
+                    getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
+                    hash,
+                    options,
+                ),
+                settle: async ({ sub, merchant, transactionHash, confirmation, settledAt, nextBillingDate }) => {
+                    await applyPullOutcome({
+                        supabase: oracleSupabase,
+                        req: null,
+                        sub,
+                        merchant,
+                        subscription_id: sub.id,
+                        txHash: transactionHash,
+                        status: confirmation.status,
+                        confirmation,
+                        extraBody: { automated: true },
+                        subscriptionAlreadySettled: true,
+                        settledAt,
+                        nextBillingDate,
+                    });
+                },
+                fail: async ({ sub, merchant, transactionHash, error }) => {
+                    await recordPullFailure(oracleSupabase, sub.id, error, transactionHash);
+                    await markSubscriptionPastDue(oracleSupabase, sub.id, {
+                        actorAddress: merchant.wallet_address,
+                        fetchImpl: app.locals.fetchImpl,
+                    });
+                },
+                options: recurringPullOptions,
+            });
+            app.locals.recurringPullWorker = startRecurringPullWorker(recurringPullWorker, {
+                intervalMs: Number(process.env.RECURRING_PULL_INTERVAL_MS) || undefined,
+            });
         }
     } else {
         console.warn("Oracle worker not started: Supabase client not initialized");

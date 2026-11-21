@@ -61,6 +61,40 @@ fn test_allowance_handshake_and_pull() {
     assert_eq!(token_client.balance(&user), 71_0000000);
 }
 
+#[test]
+fn test_vault_pulls_the_asset_configured_at_creation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let configured_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let unrelated_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let configured_client = TokenClient::new(&env, &configured_token);
+    let unrelated_client = TokenClient::new(&env, &unrelated_token);
+    let configured_admin = StellarAssetClient::new(&env, &configured_token);
+    let unrelated_admin = StellarAssetClient::new(&env, &unrelated_token);
+
+    configured_admin.mint(&user, &100);
+    unrelated_admin.mint(&user, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit_client = OrbitContractClient::new(&env, &contract_id);
+    configured_client.approve(&user, &orbit_client.address, &40, &2000000);
+    orbit_client.create_vault(&user, &merchant, &configured_token, &40, &100);
+    orbit_client.pull_funds(&user, &merchant);
+
+    assert_eq!(configured_client.balance(&merchant), 40);
+    assert_eq!(configured_client.balance(&user), 60);
+    assert_eq!(unrelated_client.balance(&merchant), 0);
+    assert_eq!(unrelated_client.balance(&user), 100);
+}
+
 // ----------------------------------------------------------------------------
 // ISSUE #1: INPUT VALIDATION IN CREATE_VAULT
 // ----------------------------------------------------------------------------
