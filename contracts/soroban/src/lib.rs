@@ -3981,6 +3981,38 @@ impl OrbitContract {
         unclaimed
     }
 
+    /// Cancels a payroll batch before it is fully paid out (#287). Only the
+    /// creator can cancel. The unclaimed balance is refunded to the creator in
+    /// one transfer and the batch is marked `reclaimed`, which blocks any later
+    /// claim, reclaim or cancel. Amounts recipients already claimed are kept.
+    /// Returns the refunded amount.
+    pub fn cancel_batch_payroll(env: Env, sender: Address, batch_id: u64) -> i128 {
+        sender.require_auth();
+
+        let mut batch = load_payroll_escrow(&env, batch_id);
+        assert!(batch.sender == sender, "Not the batch creator");
+        assert!(!batch.reclaimed, "Batch already cancelled or reclaimed");
+
+        let unclaimed = batch.total_deposited - batch.claimed_amount;
+        assert!(unclaimed > 0, "No unclaimed balance to refund");
+
+        // Mark before transferring so the batch can only be cancelled once.
+        batch.reclaimed = true;
+        save_payroll_escrow(&env, &batch);
+
+        token::Client::new(&env, &batch.token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &unclaimed,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "payroll_batch_cancelled"), sender, batch_id),
+            (batch.token, unclaimed),
+        );
+        unclaimed
+    }
+
     /// Read a payroll escrow record. Requires no authorization.
     pub fn get_payroll_escrow(env: Env, payroll_id: u64) -> Option<PayrollEscrow> {
         env.storage()
@@ -5422,3 +5454,6 @@ mod test_fuzz;
 
 #[cfg(test)]
 mod test_storage;
+
+#[cfg(test)]
+mod test_batch_cancel;

@@ -309,6 +309,58 @@ const registerWebhookAlertRoutes = (app, getSupabase, authenticateMerchant) => {
     });
 };
 
+
+/**
+ * Creates the notifier that webhooks.js calls when a circuit breaker trips to PAUSED
+ * for a merchant's webhook endpoint (#289). It resolves the merchant from the URL,
+ * then fans the alert out to their configured alert channels.
+ */
+const createEndpointAlertNotifier = (getSupabase, {
+  fetchImpl = globalThis.fetch,
+  emailRelayUrl,
+  frontendUrl,
+} = {}) => async ({ url, lastStatusCode }) => {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+
+  const { data: webhooks, error: whErr } = await supabase
+    .from('webhooks')
+    .select('id, merchant_id')
+    .eq('url', url)
+    .eq('active', true)
+    .limit(1);
+  if (whErr || !webhooks || webhooks.length === 0) return [];
+
+  const { merchant_id: merchantId } = webhooks[0];
+
+  const { data: channels, error: chErr } = await supabase
+    .from('webhook_alert_channels')
+    .select('*')
+    .eq('merchant_id', merchantId)
+    .eq('active', true);
+  if (chErr || !channels || channels.length === 0) return [];
+
+  const alert = {
+    action: 'triggered',
+    incident_id: crypto.randomUUID(),
+    title: `Webhook endpoint circuit breaker tripped: ${url}`,
+    endpoint_url: url,
+    failed_event_type: 'webhook.endpoint',
+    error_code: lastStatusCode,
+    consecutive_failures: null,
+    failure_rate: null,
+    opened_at: new Date().toISOString(),
+    resolved_at: null,
+    dlq_url: dlqInspectorUrl(null, frontendUrl),
+  };
+
+  return Promise.all(
+    channels.map((channel) =>
+      dispatchIncidentAlert(channel, alert, { fetchImpl, emailRelayUrl }),
+    ),
+  );
+};
+
 module.exports = {
     FAILURE_WINDOW_MS,
     CONSECUTIVE_FAILURE_THRESHOLD,
@@ -320,5 +372,6 @@ module.exports = {
     buildIncidentAlert,
     dispatchIncidentAlert,
     createDeliveryAlertObserver,
+    createEndpointAlertNotifier,
     registerWebhookAlertRoutes,
 };

@@ -27,8 +27,9 @@ const {
     replayWebhookEvents,
     replayDeadLetter,
     setDeliveryObserver,
+    verifyWebhookEndpoint,
 } = require('./webhooks');
-const { createDeliveryAlertObserver, registerWebhookAlertRoutes } = require('./webhook-alerts');
+const { createDeliveryAlertObserver, createEndpointAlertNotifier, registerWebhookAlertRoutes } = require('./webhook-alerts');
 const {
     DUNNING_INTERVAL_DAYS,
     MAX_DUNNING_RETRIES,
@@ -85,7 +86,8 @@ const { registerNotificationTemplateRoutes } = require('./notification-templates
 const { registerBalanceReminderRoutes } = require('./balance-reminders');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
-const { registerRpcProxyRoute } = require('./rpc-proxy');
+const { registerRpcProxyRoute, createIpWindowLimiter: createRpcIpWindowLimiter } = require('./rpc-proxy');
+const { SimulationCache, getOrSimulate } = require('./simulation-cache');
 const { registerHealthMetrics, recordPullOutcome, setDbPoolSource } = require('./health-metrics');
 const { captureStripeRawBody, registerStripeBillingRoutes } = require('./stripe-billing');
 const { registerCredentialRoutes } = require('./credentials');
@@ -2140,6 +2142,21 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+app.post('/webhooks/:id/verify', async (req, res) => {
+    try {
+        const supabase = getSupabase();
+        if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+        const result = await verifyWebhookEndpoint(supabase, {
+            webhookId: req.params.id,
+            fetchImpl: app.locals.fetchImpl,
+        });
+        if (result.statusCode) return res.status(result.statusCode).json({ error: result.error });
+        res.status(result.ok ? 200 : 502).json(result);
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    }
+});
+
 app.post('/webhooks/:id/backfill', async (req, res) => {
     const parseResult = backfillWebhookSchema.safeParse(req.body || {});
     if (!parseResult.success) {
@@ -2193,6 +2210,7 @@ registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
 // Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
 registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
 setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
+setEndpointAlertNotifier(createEndpointAlertNotifier(getSupabase));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
@@ -2421,5 +2439,110 @@ if (require.main === module) {
             process.exit(1);
         });
 }
+
+
+// Simulation footprint cache shared across requests (#290).
+const sharedSimulationCache = new SimulationCache({
+    ttlLedgers: Number(process.env.SIM_CACHE_TTL_LEDGERS) || 10,
+});
+
+// POST /simulate/quote — unauthenticated read-only endpoint that returns a
+// cached simulation result for the given transaction XDR (#290). The result
+// is served from the in-process ledger-TTL cache when possible, saving
+// 400-800ms per duplicate pre-flight call.
+app.post('/simulate/quote', createRpcIpWindowLimiter({ limit: Number(process.env.RPC_PROXY_RATE_LIMIT_MAX) || 60 }), async (req, res) => {
+    const { transaction } = req.body || {};
+    if (!transaction || typeof transaction !== 'string') {
+        return res.status(400).json({ error: 'transaction (base64 XDR) is required' });
+    }
+    const proxy = app.locals.rpcProxy;
+    if (!proxy) return res.status(503).json({ error: 'RPC proxy not available' });
+    try {
+        const ledgerResp = await proxy.call({ method: 'getLatestLedger', params: [] });
+        const ledger = ledgerResp?.result?.sequence ?? 0;
+        const cacheKey = `simulateTransaction:${transaction}`;
+        const { value, source } = await getOrSimulate(sharedSimulationCache, cacheKey, {
+            ledger,
+            simulate: () => proxy.call({ method: 'simulateTransaction', params: [{ transaction }] }),
+        });
+        res.json({ ...value, cached: source === 'cache' });
+    } catch (err) {
+        res.status(err.statusCode || 502).json({ error: err.message });
+    }
+});
+
+// GET /payroll/streams — returns active streaming payroll streams for the merchant (#291).
+app.get('/payroll/streams', authenticateMerchant, async (req, res) => {
+    const supabase = getReadSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Database client not initialized' });
+    const { data, error } = await supabase
+        .from('payroll_streams')
+        .select('id, recipient_address, recipient_label, token_symbol, rate_per_second, start_time, end_time, withdrawn_amount')
+        .eq('merchant_id', req.merchant.id)
+        .eq('active', true)
+        .order('start_time', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const streams = (data || []).map((row) => ({
+        id: row.id,
+        recipientLabel: row.recipient_label || row.recipient_address,
+        tokenSymbol: row.token_symbol || 'USDC',
+        ratePerSecond: Number(row.rate_per_second) || 0,
+        startTime: new Date(row.start_time).getTime(),
+        endTime: new Date(row.end_time).getTime(),
+        withdrawnAmount: Number(row.withdrawn_amount) || 0,
+    }));
+    res.json({ streams });
+});
+
+// POST /payroll/streams/claim — submit a withdraw_from_stream transaction (#291).
+app.post('/payroll/streams/claim', authenticateMerchant, async (req, res) => {
+    const { stream_id, amount, sender_address } = req.body || {};
+    if (!stream_id || !amount || !sender_address) {
+        return res.status(400).json({ error: 'stream_id, amount, and sender_address are required' });
+    }
+    if (typeof amount !== 'number' || amount <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!StrKey.isValidEd25519PublicKey(sender_address)) {
+        return res.status(400).json({ error: 'sender_address must be a valid Stellar public key' });
+    }
+    const supabase = getPrimarySupabase();
+    const { data: streamRow, error: strErr } = await supabase
+        .from('payroll_streams')
+        .select('id, merchant_id')
+        .eq('id', stream_id)
+        .eq('merchant_id', req.merchant.id)
+        .maybeSingle();
+    if (strErr || !streamRow) return res.status(404).json({ error: 'Stream not found or access denied' });
+    const relayer = getRelayer();
+    if (!relayer) return res.status(503).json({ error: 'Transaction relayer is not configured' });
+    const contractId = process.env.ORBIT_CONTRACT_ID;
+    if (!contractId) return res.status(503).json({ error: 'ORBIT_CONTRACT_ID is not configured' });
+    try {
+        const { rpc: RpcLib, Networks, TransactionBuilder, BASE_FEE, Contract, nativeToScVal } = require('@stellar/stellar-sdk');
+        const server = getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org');
+        const account = await server.getAccount(sender_address);
+        const rawAmount = BigInt(Math.round(amount * 10_000_000));
+        const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+        })
+            .addOperation(
+                new Contract(contractId).call(
+                    'withdraw_from_stream',
+                    nativeToScVal(BigInt(stream_id), { type: 'u64' }),
+                    nativeToScVal(rawAmount, { type: 'i128' }),
+                )
+            )
+            .setTimeout(60)
+            .build();
+        const result = await relayer.relay(tx);
+        if (result.status !== 'SUCCESS') return res.status(502).json({ error: 'Transaction failed', result });
+        res.json({ tx_hash: result.hash, status: result.status });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 module.exports = app;
