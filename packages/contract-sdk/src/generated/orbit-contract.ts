@@ -57,21 +57,25 @@ export const decodeVaultData = (value: xdr.ScVal | unknown): VaultData => decode
 export interface PaymentSplit {
   recipient: string;
   amount: bigint;
+  token: string;
 }
 
 export interface PaymentSplitInput {
   recipient: string;
   amount: Numeric;
+  token: string;
 }
 
 const PAYMENTSPLIT_ENCODERS: StructFieldEncoders<PaymentSplitInput> = {
   recipient: (value: any) => addressToScVal(value),
   amount: (value: any) => i128ToScVal(value),
+  token: (value: any) => addressToScVal(value),
 };
 
 const PAYMENTSPLIT_DECODERS: StructFieldDecoders<PaymentSplit> = {
   recipient: decodeAddress,
   amount: decodeI128,
+  token: decodeAddress,
 };
 
 export const encodePaymentSplit = (value: PaymentSplitInput): xdr.ScVal => encodeStruct(PAYMENTSPLIT_ENCODERS, value);
