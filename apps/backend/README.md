@@ -31,9 +31,17 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `RECONCILE_EVENT_LOOKBACK_LEDGERS` | Ledgers scanned back when no event cursor is stored or it has left RPC retention (defaults to 17280, ~1 day) | `17280` |
 | `RECONCILE_GRACE_SECONDS` | Subscriptions younger than this are not checked against `get_vault` (defaults to 300) | `300` |
 | `RATE_LIMIT_WINDOW_MS` | Sliding window length for both rate limits (defaults to 60000) | `60000` |
-| `API_KEY_RATE_LIMIT_MAX` | Requests per window allowed for each API key on authenticated routes (defaults to 100) | `100` |
+| `API_KEY_FREE_TIER_LIMIT` | Requests per window for `free` tier API keys (defaults to `API_KEY_RATE_LIMIT_MAX`, else 60) | `60` |
+| `API_KEY_PRO_TIER_LIMIT` | Requests per window for `pro` tier API keys (defaults to 600) | `600` |
+| `API_KEY_RATE_LIMIT_MAX` | Legacy name for the free tier quota, used when `API_KEY_FREE_TIER_LIMIT` is unset | `60` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
 | `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
+| `REDIS_URL` | Redis shared by all API instances for rate limits and reputation; unset keeps them in memory per process | `redis://localhost:6379` |
+| `REDIS_COMMAND_TIMEOUT_MS` | Redis command timeout before a request falls back to in-memory limits (defaults to 250) | `250` |
+| `RATE_LIMIT_REDIS_RETRY_MS` | How long to stay on the in-memory fallback after a Redis failure (defaults to 5000) | `5000` |
+| `RATE_LIMIT_REDIS_PREFIX` | Key prefix for rate limit data in Redis (defaults to `orbit:rl:`) | `orbit:rl:` |
+| `REPUTATION_IP_TRUST_AFTER_MS` | How long an IP counts as new and gets the reduced limit (defaults to 600000) | `600000` |
+| `HORIZON_URL` | Horizon server used to look up merchant wallet age for rate limits; unset disables wallet-age scoring | `https://horizon-testnet.stellar.org` |
 | `RELAYER_SECRET_KEY` | Orbit relayer account that pays sponsored pull fees (fee-bump fee source). `/relay/*` returns 503 when unset | `S...` |
 | `RELAYER_CHANNEL_SECRET_KEYS` | Optional comma-separated channel accounts used as inner transaction sources (defaults to the relayer account) | `S...,S...` |
 | `RELAYER_DAILY_FEE_LIMIT_STROOPS` | Sponsored fee budget per merchant per UTC day (defaults to 50000000 = 5 XLM) | `50000000` |
@@ -42,10 +50,24 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `RELAYER_MAX_ATTEMPTS` | Submission attempts on `txBadSeq` / `TRY_AGAIN_LATER` (defaults to 3) | `3` |
 | `RELAYER_QUEUE_TIMEOUT_MS` | Longest a relay waits for a free channel before `503` (defaults to 30000) | `30000` |
 | `RELAYER_AUTH_VALIDITY_LEDGERS` | Ledgers a prepared merchant authorization remains signable (defaults to 100, ~8 minutes) | `100` |
+| `RECURRING_PULLS_ENABLED` | Starts the recurring pull daemon only when explicitly set to `true`; requires the relayer and the recurring-pull migration | `false` |
+| `RECURRING_PULL_SIGNER_URL` | HTTPS endpoint for the merchant-controlled signer/HSM gateway; receives a scoped pull authorization, never a private key | `https://signer.example/sign` |
+| `RECURRING_PULL_SIGNER_TOKEN` | Bearer token used to authenticate requests to the configured signer | `******` |
+| `RECURRING_PULL_INTERVAL_MS` | Delay between daemon scans (defaults to 30000 ms) | `30000` |
+| `RECURRING_PULL_MAX_ATTEMPTS` | Maximum submission attempts per cycle, including the first attempt (defaults to 4) | `4` |
 | `RELAYER_RATE_LIMIT_MAX` / `RELAYER_RATE_LIMIT_WINDOW_MS` | Relay requests allowed per merchant per window (defaults to 10 per 60000 ms) | `10` |
 | `ORACLE_SYNC_INTERVAL_MS` | Background worker refresh interval for the fiat → USDC rate cache (defaults to 300000 = 5 min) | `300000` |
 | `ORACLE_SLIPPAGE_TOLERANCE_BPS` | Maximum rate movement from a subscription's quoted rate that a fiat pull may settle at (defaults to 200 = 2%) | `200` |
 | `ORACLE_FETCH_TIMEOUT_MS` | Price feed request timeout in milliseconds (defaults to 6000) | `6000` |
+| `SPLIT_RELAYER_SECRET_KEY` | Account that signs on-chain payout-split transfers; falls back to `RELAYER_SECRET_KEY`. Splits stay pending when unset | `S...` |
+| `SPLIT_TOKEN_CONTRACT_ID` | Stellar Asset Contract used for split payouts; falls back to `USDC_CONTRACT_ID` | `C...` |
+| `PRICE_INDEXATION_INTERVAL_MS` | Delay between price indexation worker runs (defaults to 900000 = 15 min) | `900000` |
+| `METRICS_TOKEN` | Bearer token required by `GET /metrics`; when unset the endpoint answers 403 | `a-long-random-token` |
+| `WEBHOOK_MAX_ATTEMPTS` | Delivery attempts before a webhook goes to the dead-letter queue (defaults to 5) | `5` |
+| `WEBHOOK_RETRY_BASE_MS` / `WEBHOOK_RETRY_MAX_MS` | Base and maximum retry backoff; delays double per attempt with jitter (defaults to 30000 / 1800000) | `30000` |
+| `DEV_FRIENDBOT_URL` | Friendbot used by `POST /api/dev/fund` (defaults to the public testnet Friendbot) | `https://friendbot.stellar.org` |
+| `DEV_FUND_HORIZON_URL` | Horizon used for the dev USDC trustline (defaults to `HORIZON_URL`, else testnet Horizon) | `https://horizon-testnet.stellar.org` |
+| `DEV_USDC_ISSUER` | USDC issuer the dev trustline points at (defaults to Circle's testnet issuer) | `GBBD47...LFLA5` |
 
 ### Running the API
 
@@ -57,6 +79,15 @@ node index.js
 
 The service runs at `http://localhost:3001`.
 
+The automated pull daemon is opt-in. Before enabling it, apply the backend
+migrations and configure the relayer plus an authenticated merchant-controlled
+signer/HSM endpoint. The signer receives the exact Soroban authorization entry,
+subscriber and merchant addresses, contract, network, and ledger expiry; it
+must enforce its own merchant authorization policy and return
+`signed_auth_entry_xdr`. Pull claims are unique per vault and scheduled billing
+cycle, and an unconfirmed transaction hash is retained for polling rather than
+submitting a replacement. Transient failures retry after 1, 5, and 15 minutes.
+
 ---
 
 ## API Routes Overview
@@ -66,6 +97,11 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/plans` | API key | Create a new recurring pricing plan |
 | `GET` | `/plans/:id` | Public | Fetch plan and merchant details |
 | `GET` | `/subscribers` | API key | List active subscribers for a merchant |
+| `POST` | `/usage-records` | API key | Atomically ingest exact metered usage |
+| `GET` | `/usage-reconciliation/:subscriptionId` | API key | Compare rolled-up usage with the plan limit |
+| `GET` | `/analytics/cohorts` | API key | History-correct retention cohorts and churn drilldown |
+| `GET/PUT` | `/notification-templates/:type` | API key | Manage transactional templates |
+| `POST` | `/notification-templates/:type/test` | API key | Send a real test email to the merchant address |
 | `GET` | `/rates` | Public | Supported fiat → USDC pairs with their newest cached rate |
 | `POST` | `/trigger-pull` | API key | Prepare an unsigned merchant pull transaction |
 | `POST` | `/submit-pull` | API key | Verify and submit a wallet-signed pull transaction |
@@ -76,6 +112,21 @@ The service runs at `http://localhost:3001`.
 | `POST` | `/api-keys` | API key | Create an API key (secret shown once) |
 | `GET` | `/api-keys` | API key | List the merchant's API keys |
 | `DELETE` | `/api-keys/:id` | API key | Revoke an API key |
+| `GET` | `/payout-splits` | API key | List the merchant's payout split rules |
+| `POST` | `/payout-splits` | API key | Create a payout split rule |
+| `PATCH` | `/payout-splits/:id` | API key | Update a payout split rule |
+| `DELETE` | `/payout-splits/:id` | API key | Deactivate a payout split rule |
+| `GET` | `/payout-distributions` | API key | List recorded split distributions |
+| `POST` | `/payout-distributions/reconcile` | API key | Retry pending split forwards |
+| `GET` | `/plans/:id/price-schedules` | API key | List a plan's scheduled price changes |
+| `POST` | `/plans/:id/price-schedules` | API key | Schedule a future plan price change |
+| `DELETE` | `/price-schedules/:id` | API key | Cancel a scheduled price change |
+| `POST` | `/price-schedules/process` | API key | Run the notice/apply pipeline once |
+| `POST` | `/price-reauthorizations/:token/authorize` | Public | Subscriber accepts updated allowance terms |
+| `GET` | `/webhooks/dead-letters` | Merchant | Webhook deliveries that failed every retry (`merchant_id` query) |
+| `POST` | `/webhooks/dead-letters/:id/replay` | Merchant | Re-send a dead-lettered delivery once (`merchant_id` body) |
+| `GET` | `/metrics` | `METRICS_TOKEN` | Prometheus metrics |
+| `POST` | `/api/dev/fund` | Dev only | Fund a testnet account via Friendbot and add the USDC trustline; not registered when `NODE_ENV=production` |
 
 ---
 
@@ -122,12 +173,42 @@ curl -X DELETE http://localhost:3001/api-keys/<key id> -H "Authorization: Bearer
 
 ### Rate limiting
 
-Two in-memory sliding-window limits apply (default window 60 seconds):
+Sliding-window-log limits apply (default window 60 seconds):
 
-- **Per client IP** on every route, including public ones and failed authentication attempts (`IP_RATE_LIMIT_MAX`, default 300).
-- **Per API key** on authenticated routes (`API_KEY_RATE_LIMIT_MAX`, default 100).
+- **Per client IP** on every route, including public ones and failed authentication attempts (base `IP_RATE_LIMIT_MAX`, default 300).
+- **Per API key** on authenticated routes. The base is the key's tier quota (`api_keys.rate_limit_tier`): `free` 60 and `pro` 600 requests per minute by default (`API_KEY_FREE_TIER_LIMIT`, `API_KEY_PRO_TIER_LIMIT`). Keys without a tier are `free`.
+- **Per merchant** on `/relay/*` (see below).
 
-Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (seconds until the oldest counted request leaves the window) and `RateLimit-Policy`. Over the limit the API returns `429 Too Many Requests` with `Retry-After`. Counters are per process; with several API instances behind a load balancer each enforces its own limit.
+With `REDIS_URL` set, every limit lives in Redis (one sorted set per client, checked and updated by a single Lua script), so all API instances behind a load balancer enforce one shared limit. If Redis becomes unreachable each instance falls back to in-memory limits, retrying Redis every `RATE_LIMIT_REDIS_RETRY_MS`. Without `REDIS_URL` limits are per process.
+
+Each base limit is scaled by the client's reputation, stored alongside the limits:
+
+| Signal | Effect |
+|--------|--------|
+| New IP (first seen less than `REPUTATION_IP_TRUST_AFTER_MS` ago, default 10 minutes) | 0.5x the IP limit |
+| IP that authenticated with a valid API key in the last 24 hours | 4x the IP limit |
+| 429s from the IP limit in the last 15 minutes (counter restarts on every new violation) | IP limit divided by `1 + 0.25 × violations`, never below 5% |
+| `live` API key | 3x the API key limit (`test` keys 1x) |
+| Merchant wallet younger than 7 days or not on the network | 0.5x the API key limit |
+| Merchant wallet older than 90 days | 1.5x the API key limit |
+
+Wallet age is the timestamp of the account's first operation on Horizon, cached for 7 days; it is only scored when `HORIZON_URL` is set, and an unknown age is neutral.
+
+Responses carry `RateLimit-Limit` (the client's effective limit), `RateLimit-Remaining`, `RateLimit-Reset` (seconds until the oldest counted request leaves the window) and `RateLimit-Policy`, plus `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` (Unix time in seconds when `Remaining` next increases). Over the limit the API returns `429 Too Many Requests` with `Retry-After` and a JSON body:
+
+```json
+{
+  "error": "API key rate limit exceeded, please retry later",
+  "code": "rate_limit_exceeded",
+  "limit": 60,
+  "remaining": 0,
+  "retry_after": 12,
+  "reset_at": "2026-11-19T10:00:12.000Z",
+  "tier": "free"
+}
+```
+
+`npm test` uses in-memory limits. To also run the Lua scripts against a real Redis, start one and run `REDIS_TEST_URL=redis://127.0.0.1:6379 npm test`.
 
 ---
 
@@ -658,6 +739,9 @@ Row Level Security is enabled on all tables in `schema.sql` with a locked-down p
   }
   ```
 
+## Merchant verified analytics (issue #77)
+
+See [ANALYTICS.md](./ANALYTICS.md) for secure wallet login, staging migrations and metric accounting semantics.
 ## Streaming transaction CSV export (#76)
 
 Authenticated merchants can download settled on-chain payments using
@@ -724,3 +808,228 @@ end-to-end promotional billing feature. Don't deploy it as finished billing.
 The public legacy subscription creation route does not itself authenticate a
 wallet; production coupon redemption must be coupled to proof of a confirmed
 vault handshake to prevent malicious consumption of finite coupon inventories.
+
+## Batched pull (`batch_pull_funds`, #92)
+
+The Soroban contract exposes `batch_pull_funds(merchant, subscribers)` so a
+merchant can settle every due subscriber in a single transaction instead of one
+`pull_funds` per vault. A batch is capped at `MAX_BATCH_PULL_SUBSCRIBERS` (50)
+subscribers, and the call returns a `Vec<BatchPullResult>` with one entry per
+subscriber **in the same order as the input**:
+
+| Field | Meaning |
+|---|---|
+| `subscriber` | The vault owner that was attempted. |
+| `success` | `true` if funds were pulled; `false` if the vault was inactive, not due, or already locked. |
+| `amount` | Raw token units pulled (`0` when `success` is `false`). |
+
+A subscriber that fails is skipped without reverting the whole batch. Sibling
+vaults, auth entries and token state are otherwise untouched. The typed client in
+`packages/contract-sdk` exposes this as
+`orbit.batchPullFunds({ merchant, subscribers })`.
+
+## Contract SDK and ABI codegen (#159)
+
+Contract calls used to be assembled by hand as `xdr.ScVal` values in several
+places. `packages/contract-sdk` (`@orbit/contract-sdk`) now owns one typed
+surface, generated from the canonical ABI at
+`apps/backend/abi/orbit_soroban.abi.json`.
+
+```bash
+cd apps/backend
+npm run inspect-contract        # optional: verify ABI against a compiled WASM
+npm run generate:contract-sdk   # rewrite packages/contract-sdk/src/generated
+```
+
+`inspect-contract` uses the `stellar` CLI to compare the ABI with the exported
+WASM functions when a compiled contract is present, and falls back to the
+checked-in ABI with a warning otherwise (so generation works without a Rust
+toolchain). `generate:contract-sdk` emits the typed `OrbitContractClient`, the
+`*Input` interfaces and the ScVal codecs, and mirrors the ABI into the package.
+Commit the regenerated file with any ABI change. See
+[`packages/contract-sdk/README.md`](../../packages/contract-sdk/README.md) for
+usage.
+
+## Merchant payout splits (#160)
+
+Merchants can route a share of each settled pull to other Stellar accounts
+(platform fees, partners, affiliates). Each active split rule claims a
+percentage of the settlement in basis points; the primary merchant keeps
+whatever the splits do not allocate. Rules must use unique recipients and their
+combined basis points may not exceed 100% (10000 bps), and a merchant may have at
+most 20 active rules.
+
+Routes (all API-key authenticated):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/payout-splits` | List split rules for the merchant. |
+| `POST` | `/payout-splits` | Create a rule (`recipient_wallet`, `percentage_basis_points`, optional `label` and `is_active`). |
+| `PATCH` | `/payout-splits/:id` | Update a rule's `percentage_basis_points`, `label` or `is_active`. |
+| `DELETE` | `/payout-splits/:id` | Deactivate a rule. |
+| `GET` | `/payout-distributions` | List recorded distributions and their forward status. |
+| `POST` | `/payout-distributions/reconcile` | Retry `pending` forwards and settle them against the chain. |
+
+Allocation runs when a pull settles (`applyPullOutcome` SUCCESS path, shared by
+`/submit-pull` and `/relay/submit-pull`). Shares are computed with integer math
+and any rounding remainder is awarded to the largest share, so the distributions
+always sum to the settled amount and no dust is left behind. Each distribution is
+recorded before it is forwarded, so a failed transfer becomes a retryable
+`pending` row rather than a lost payout. On-chain transfers are signed by
+`SPLIT_RELAYER_SECRET_KEY` (or `RELAYER_SECRET_KEY`) using the token in
+`SPLIT_TOKEN_CONTRACT_ID` (or `USDC_CONTRACT_ID`); when neither is configured the
+distributions are still recorded as `pending` for manual reconciliation.
+
+Migration: run `apps/backend/migrations/160-payout-splits.sql` on existing
+databases (also appended to `schema.sql`).
+
+## Recurring plan price indexation (#164)
+
+Scheduled plan price changes let a merchant raise a plan's price and have it
+applied to existing subscribers on a future date, with a configurable advance
+notice. Schedules carry an `effective_date`, an `advance_notice_days` window and
+the new `new_usdc_amount` (optionally `new_price_amount`).
+
+Routes:
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/plans/:id/price-schedules` | API key | List a plan's scheduled changes. |
+| `POST` | `/plans/:id/price-schedules` | API key | Schedule a change. |
+| `DELETE` | `/price-schedules/:id` | API key | Cancel a `scheduled`/`notified` change. |
+| `POST` | `/price-schedules/process` | API key | Run the notice/apply pass once (also useful in tests). |
+| `POST` | `/price-reauthorizations/:token/authorize` | Public | Subscriber accepts the updated allowance terms. |
+
+A background worker (also started from `index.js`, interval
+`PRICE_INDEXATION_INTERVAL_MS`, default 15 min) first notifies every active
+subscriber inside the notice window by minting a one-click re-authorization link
+(`plan_price_reauthorizations`), then applies schedules whose effective date has
+arrived by updating the plan price and emitting a `plan.price_changed` webhook.
+Notices always run before applies, so a change can never take effect without
+having been announced. Applying a schedule is idempotent and audited.
+
+Migration: run `apps/backend/migrations/164-plan-price-indexation.sql` on
+existing databases (also appended to `schema.sql`).
+
+## Database migrations and schema guard (#157)
+
+Schema changes ship as versioned files in `migrations/` named
+`YYYYMMDDHHMMSS_description.sql` (or `.js`). SQL files hold both directions:
+
+```sql
+-- migrate:up
+CREATE TABLE widgets (id INT PRIMARY KEY);
+-- migrate:down
+DROP TABLE widgets;
+```
+
+JS files export `async up(db)` / `async down(db)` (`db.query(text, params)`).
+
+| Command | Effect |
+|---|---|
+| `npm run migrate:up` | Apply every pending migration (`-- --steps N` for the next N). |
+| `npm run migrate:down` | Roll back the last applied migration (`-- --steps N` for more). |
+| `npm run migrate:status` | List applied/pending migrations and flag checksum drift. |
+
+Each migration runs in its own `BEGIN ... COMMIT`; any error rolls the whole
+migration back and stops the run. Applied versions are recorded in
+`schema_migrations` with execution time and the file's SHA-256, and an advisory
+lock keeps two deploys from migrating at once. Add `-- migrate:no-transaction`
+to a file for statements Postgres can't run in a transaction (e.g.
+`CREATE INDEX CONCURRENTLY`).
+
+When `DATABASE_URL` is set, `node index.js` checks the database before serving
+and exits if a migration is pending, was edited after being applied, or is
+unknown to the build. The older `NNN-name.sql` files predate the runner, are
+already part of `schema.sql`, and are ignored by it.
+
+## Stripe fiat billing bridge (#131)
+
+`POST /webhooks/stripe` receives Stripe events, verifies the `Stripe-Signature`
+header (HMAC-SHA256 over the raw body, 5-minute tolerance, any secret in
+`STRIPE_WEBHOOK_SECRET`) and handles:
+
+| Event | Effect |
+|---|---|
+| `customer.subscription.created` | Upserts `fiat_subscriptions` with status and normalized MRR. |
+| `invoice.paid` | Records `fiat_payments` (once per invoice) and marks the subscription active. |
+| `customer.subscription.deleted` | Marks the subscription `canceled`. |
+
+Events are mapped to a merchant through the Stripe Connect account
+(`merchants.stripe_account_id`), else an `orbit_merchant_id` metadata key on the
+Stripe subscription. Every event id is claimed in `stripe_webhook_events` before
+processing, so replays and duplicate deliveries are acknowledged without effect;
+a failed event releases its claim and returns 500 so Stripe retries it. Older
+events never overwrite newer subscription state.
+
+`GET /billing/unified-summary` (API key) returns active subscribers and MRR for
+the USDC and Stripe rails plus a combined USD total (USDC counted 1:1; non-USD
+fiat is reported per currency and listed in `unconverted_currencies`).
+
+Migration: `migrations/20261018000000_stripe_fiat_billing.sql`.
+
+## Verifiable subscription credentials (#132)
+
+Merchants can hand subscribers a signed credential that third-party services
+(Discord bots, gated downloads, private APIs) verify without database access or
+the subscriber's wallet address.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/credentials` | API key | Issue a credential for an active subscription (`subscription_id`, optional `ttl_seconds`, max 30 days). |
+| `POST` | `/credentials/verify` | Public | `{ token }` → `{ valid, claims }` or `{ valid: false, reason }`. |
+| `GET` | `/credentials/jwks` | Public | Ed25519 public key(s) for offline verification. |
+| `POST` | `/credentials/:jti/revoke` | API key | Revoke one credential. |
+
+Credentials are EdDSA (Ed25519) JWTs with claims `sub` (an HMAC pseudonym of the
+wallet, different per merchant), `merchant_id`, `plan_tier` and `valid_until`
+(never past the next billing date). Verification checks the signature, expiry,
+the revocation list (`credential_revocations`, cached in memory) and that the
+subscription is still active. Cancelling a subscription revokes its credentials
+immediately.
+
+`credential-verifier.js` is a dependency-free helper services can copy:
+`verifyCredentialToken(token, { jwks })` checks authenticity and expiry offline,
+and `verifyCredentialOnline(token, { baseUrl })` also checks revocation.
+
+Migration: `migrations/20261018000100_subscription_credentials.sql`.
+
+---
+
+## Webhook Delivery
+
+Every delivery is signed with the endpoint's signing secret:
+
+```
+X-Orbit-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+```
+
+Verify it against the **raw** request body, and reject timestamps more than 5 minutes from your clock to block replays. During a secret rotation, accept either the current or the previous secret. `X-Orbit-Delivery` identifies the delivery and `X-Orbit-Attempt` the attempt number.
+
+A delivery fails on a non-2xx response, a network error or a 6-second timeout. Failed deliveries are retried in the background, so dispatching never waits on a slow endpoint. There are up to `WEBHOOK_MAX_ATTEMPTS` attempts (default 5) with jittered exponential backoff: the delay doubles from `WEBHOOK_RETRY_BASE_MS`, capped at `WEBHOOK_RETRY_MAX_MS`, and is randomized between 50% and 100% of that value. The delivery's `status` is `retrying` with `next_retry_at` until it succeeds or attempts run out. It then becomes `dead_lettered` and is archived in `webhook_dead_letters`. Merchants can list those with `GET /webhooks/dead-letters` and re-send one with `POST /webhooks/dead-letters/:id/replay`.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text format and requires `Authorization: Bearer $METRICS_TOKEN` (or `X-Metrics-Token`). Missing tokens get 401, wrong tokens 403, and with no `METRICS_TOKEN` configured the endpoint always answers 403. Besides Node.js process metrics and HTTP/RPC latency it exposes:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `orbit_pull_duration_seconds` | histogram | `status` | Time spent waiting for Soroban confirmation of a pull (all polls, including fee-bump re-submissions) |
+| `orbit_pull_total` | counter | `status` = `success`, `failed`, `timeout` | Pull outcomes; `timeout` means still unconfirmed when polling stopped |
+| `orbit_webhook_delivery_total` | counter | `outcome` = `success`, `failed`, `dead_lettered` | Delivery attempts, and transfers to the dead-letter queue |
+| `orbit_db_pool_active` | gauge | | Connections checked out of the backend's Postgres pools |
+
+## Testnet Dev Funding
+
+Outside production, `POST /api/dev/fund` bootstraps a testnet account in one call. Friendbot funding is retried on transient errors, and an already-funded account is not an error. Before adding the USDC trustline, the helper checks that the asset exists and skips the trustline if the account already has it:
+
+```bash
+# Fund an account you control and add the USDC trustline
+curl -X POST localhost:3001/api/dev/fund -H 'Content-Type: application/json' -d '{"secret_key":"S..."}'
+# Fund only (a trustline must be signed by the account's secret)
+curl -X POST localhost:3001/api/dev/fund -H 'Content-Type: application/json' -d '{"public_key":"G..."}'
+# Generate, fund and return a new keypair
+curl -X POST localhost:3001/api/dev/fund -H 'Content-Type: application/json' -d '{}'
+```
+
+The route is not registered when `NODE_ENV=production`, it re-checks `NODE_ENV` on every request, and it refuses to run when `STELLAR_NETWORK_PASSPHRASE` is not the testnet passphrase. The helpers `fundTestnetAccount(publicKey)` and `ensureUsdcTrustline(keypair)` are exported from `dev-faucet.js` for scripts and tests.

@@ -5,6 +5,7 @@ const { buildSubgraphSchema } = require('@apollo/subgraph');
 const { parse, GraphQLError } = require('graphql');
 const DataLoader = require('dataloader');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { parseApiKey, hashApiKey } = require('./apiKeys');
 
 const typeDefs = parse(`
   extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
@@ -50,6 +51,23 @@ const typeDefs = parse(`
   input Timeframe { from: String!, to: String! }
   type SubscriptionPage { nodes: [Subscription!]!, total: Int!, limit: Int!, offset: Int! }
   type Analytics { activeSubscribers: Int!, settledPayments: Int!, settledAmount: String!, from: String!, to: String! }
+  type PaymentSettlement {
+    id: ID!
+    merchantId: ID!
+    subscriptionId: ID
+    amount: String
+    txHash: String
+    status: String
+    eventType: String!
+    settledAt: String!
+  }
+  schema {
+    query: Query
+    subscription: SubscriptionFeed
+  }
+  type SubscriptionFeed {
+    subscriptionSettlementFeed(merchantId: ID!): PaymentSettlement!
+  }
   type Query {
     merchant(id: ID!): Merchant
     subscribers(filter: SubscriberFilter, pagination: Pagination): SubscriptionPage!
@@ -58,6 +76,60 @@ const typeDefs = parse(`
 `);
 
 const badInput = (message) => { throw new GraphQLError(message, { extensions: { code: 'BAD_USER_INPUT' } }); };
+const GRAPHQL_MAX_DEPTH = 6;
+const GRAPHQL_MAX_COMPLEXITY = 1000;
+const GRAPHQL_INTERNAL_MAX_COMPLEXITY = 10000;
+
+function queryValidation(document) {
+    const fragments = new Map(document.definitions.filter((d) => d.kind === 'FragmentDefinition')
+        .map((d) => [d.name.value, d]));
+    let totalCost = 0;
+    const fieldWeights = { payments: 25, payrollSplits: 20, subscriptions: 15, plans: 10 };
+    function walk(selectionSet, depth = 1, seen = new Set()) {
+        if (!selectionSet) return;
+        if (depth > GRAPHQL_MAX_DEPTH) {
+            throw new GraphQLError(`GraphQL query depth exceeds maximum of ${GRAPHQL_MAX_DEPTH}`, {
+                extensions: { code: 'GRAPHQL_DEPTH_EXCEEDED' },
+            });
+        }
+        for (const selection of selectionSet.selections) {
+            if (selection.kind === 'FragmentSpread') {
+                if (seen.has(selection.name.value)) continue;
+                const fragment = fragments.get(selection.name.value);
+                walk(fragment?.selectionSet, depth + 1, new Set([...seen, selection.name.value]));
+                continue;
+            }
+            if (selection.kind === 'InlineFragment') {
+                walk(selection.selectionSet, depth + 1, seen);
+                continue;
+            }
+            const name = selection.name?.value || '';
+            const argumentsCost = selection.arguments?.length ? 2 : 0;
+            totalCost += 1 + argumentsCost + (fieldWeights[name] || 0);
+            if (selection.selectionSet) walk(selection.selectionSet, depth + 1, seen);
+        }
+    }
+    for (const operation of document.definitions.filter((d) => d.kind === 'OperationDefinition')) {
+        walk(operation.selectionSet);
+    }
+    return totalCost;
+}
+
+function validateGraphqlQuery(source, options = {}) {
+    if (typeof source !== 'string') throw new GraphQLError('GraphQL query must be a string');
+    let document;
+    try { document = parse(source); }
+    catch (error) { throw new GraphQLError(error.message, { extensions: { code: 'GRAPHQL_PARSE_FAILED' } }); }
+    const cost = queryValidation(document);
+    const maxCost = options.internalService ? GRAPHQL_INTERNAL_MAX_COMPLEXITY : GRAPHQL_MAX_COMPLEXITY;
+    if (cost > maxCost) {
+        throw new GraphQLError(`GraphQL query complexity ${cost} exceeds maximum budget ${maxCost}`, {
+            extensions: { code: 'GRAPHQL_COMPLEXITY_EXCEEDED' },
+        });
+    }
+    return { document, cost };
+}
+
 const uuid = (value) => {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) badInput('Invalid identifier');
     return value;
@@ -130,6 +202,17 @@ const subscribers = (_, { filter, pagination: input }, ctx) => ctx.loaders.subsc
 });
 
 const resolvers = {
+    SubscriptionFeed: {
+        subscriptionSettlementFeed: {
+            subscribe: (_, { merchantId }, ctx) => {
+                if (!ctx.merchant || ctx.merchant.id !== merchantId) {
+                    throw new GraphQLError('Forbidden merchant stream', { extensions: { code: 'FORBIDDEN' } });
+                }
+                return ctx.eventBus.subscribe(merchantId);
+            },
+            resolve: (source) => source.subscriptionSettlementFeed,
+        },
+    },
     Query: {
         merchant: (_, { id }, ctx) => ctx.loaders.merchant.load(uuid(id)),
         subscribers,
@@ -206,34 +289,91 @@ function registerGraphql(app, getSupabase, authenticateMerchant) {
             next();
         } catch { res.status(401).json({ error: 'Wallet authentication failed' }); }
     };
-    const server = new ApolloServer({ schema: buildSubgraphSchema([{ typeDefs, resolvers }]),
+    const schema = buildSubgraphSchema([{ typeDefs, resolvers }]);
+    const server = new ApolloServer({ schema,
         includeStacktraceInErrorResponses: false,
-        plugins: [{ async requestDidStart() { return { async didResolveOperation({ document }) {
-            let fields = 0;
-            const fragments = new Map(document.definitions.filter((d) => d.kind === 'FragmentDefinition').map((d) => [d.name.value, d]));
-            function walk(set, depth = 0, seen = new Set()) {
-                if (!set) return;
-                if (depth > 10) badInput('Query nesting limit exceeded');
-                for (const selection of set.selections) {
-                    if (++fields > 500) badInput('Query field limit exceeded');
-                    if (selection.kind === 'FragmentSpread') {
-                        if (seen.has(selection.name.value)) continue;
-                        walk(fragments.get(selection.name.value)?.selectionSet, depth, new Set([...seen, selection.name.value]));
-                    } else walk(selection.selectionSet, depth + 1, seen);
-                }
-            }
-            for (const operation of document.definitions.filter((d) => d.kind === 'OperationDefinition')) walk(operation.selectionSet);
-        } }; } }],
+        plugins: [{
+            async requestDidStart({ request }) {
+                const headers = request.http?.headers;
+                const internalToken = headers?.get?.('x-orbit-service-token');
+                const configuredToken = process.env.ORBIT_INTERNAL_SERVICE_TOKEN;
+                const internalService = Boolean(configuredToken && internalToken === configuredToken);
+                return {
+                    async didResolveOperation({ document }) {
+                        const cost = queryValidation(document);
+                        const maxCost = internalService ? GRAPHQL_INTERNAL_MAX_COMPLEXITY : GRAPHQL_MAX_COMPLEXITY;
+                        if (cost > maxCost) {
+                            throw new GraphQLError(`GraphQL query complexity ${cost} exceeds maximum budget ${maxCost}`, {
+                                extensions: { code: 'GRAPHQL_COMPLEXITY_EXCEEDED' },
+                            });
+                        }
+                    },
+                };
+            },
+        }],
     });
     let middleware;
     const ready = server.start().then(() => { middleware = expressMiddleware(server, { context: async ({ req }) => ({
         merchant: req.merchant, walletAddress: req.merchant.wallet_address, apiKey: req.apiKey || null,
         supabase: getSupabase(), loaders: createLoaders(getSupabase(), req.merchant),
     }) }); });
-    app.use('/graphql', authenticate, async (req, res, next) => {
+    app.use('/graphql', async (req, res, next) => {
+        if (typeof req.body?.query === 'string') {
+            const internalToken = req.get('X-Orbit-Service-Token');
+            const configuredToken = process.env.ORBIT_INTERNAL_SERVICE_TOKEN;
+            const internalService = Boolean(configuredToken && internalToken === configuredToken);
+            try {
+                validateGraphqlQuery(req.body.query, { internalService });
+            } catch (error) {
+                if (error instanceof GraphQLError) {
+                    return res.status(400).json({
+                        errors: [{ message: error.message, extensions: error.extensions }],
+                    });
+                }
+                throw error;
+            }
+        }
+        next();
+    }, authenticate, async (req, res, next) => {
         try { await ready; return middleware(req, res, next); } catch (error) { next(error); }
     });
+    // Authentication is required at WebSocket connect time, before any
+    // subscription operation can receive merchant events.
+    server.attachWebsocket = (httpServer) => {
+        const { WebSocketServer } = require('ws');
+        const { useServer } = require('graphql-ws/use/ws');
+        const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
+        const cleanup = useServer({
+            schema,
+            keepAlive: 12000,
+            onConnect: async (ctx) => {
+                const header = ctx.connectionParams?.authorization || ctx.connectionParams?.Authorization;
+                const token = typeof header === 'string' && /^Bearer\s+(\S+)$/i.exec(header)?.[1];
+                const parsed = token && parseApiKey(token);
+                if (!parsed) throw new Error('Authentication required');
+                const supabase = getSupabase();
+                if (!supabase) throw new Error('Authentication service unavailable');
+                const { data: key, error } = await supabase.from('api_keys')
+                    .select('key_prefix,environment,revoked_at,merchants(id,name,wallet_address)')
+                    .eq('key_hash', hashApiKey(token)).maybeSingle();
+                if (error || !key || key.revoked_at || !key.merchants ||
+                    key.key_prefix !== parsed.prefix || key.environment !== parsed.environment) {
+                    throw new Error('Invalid or revoked API key');
+                }
+                ctx.extra.merchant = key.merchants;
+            },
+            context: (ctx) => ({
+                merchant: ctx.extra.merchant,
+                eventBus: app.locals.paymentEventBus,
+            }),
+        }, wsServer);
+        server.closeWebsocket = async () => {
+            await cleanup.dispose();
+            await new Promise((resolve) => wsServer.close(resolve));
+        };
+        return wsServer;
+    };
     return server;
 }
 
-module.exports = { registerGraphql, createLoaders };
+module.exports = { registerGraphql, createLoaders, validateGraphqlQuery, queryValidation };

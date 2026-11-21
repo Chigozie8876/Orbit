@@ -24,7 +24,9 @@
     "papaparse": "^5.7.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tailwind-merge": "^3.0.1"
+    "tailwind-merge": "^3.0.1",
+    "@albedo-link/intent": "^0.13.0",
+    "next-themes": "^0.4.6"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.7",
@@ -39,5 +41,10 @@
     "postcss": "^8.5.2",
     "tailwindcss": "^4.0.8",
     "typescript": "^5.7.3"
+  },
+  "optionalDependencies": {
+    "@next/swc-linux-x64-gnu": "^16.4.6",
+    "@tailwindcss/oxide-linux-x64-gnu": "^4.3.5",
+    "lightningcss-linux-x64-gnu": "^1.33.0"
   }
 }

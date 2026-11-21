@@ -28,6 +28,8 @@ export const metadata: Metadata = {
   },
 };
 
+import { DashboardThemeProvider } from "@/lib/dashboard-theme";
+import { FiatRatesProvider } from "@/lib/fiat-rates";
 import { AuthProvider } from "@/lib/auth-context";
 import { NotificationProvider } from "@/lib/notification-context";
 import { ToastNotificationCenter } from "@/components/ui/toast-notification-center";
@@ -43,7 +45,7 @@ export default async function RootLayout({
   const locale = isLocale(cookieLocale) ? cookieLocale : defaultLocale;
 
   return (
-    <html lang={locale}>
+    <html lang={locale} suppressHydrationWarning>
       <head>
         <link rel="icon" href="/favicon-badge.png?v=3" type="image/png" />
         <link rel="shortcut icon" href="/favicon-badge.png?v=3" type="image/png" />
@@ -51,16 +53,20 @@ export default async function RootLayout({
       </head>
       <body className="min-h-screen bg-[#FAFAFB] text-[#09090B] selection:bg-black selection:text-white antialiased">
         <I18nProvider initialLocale={locale}>
-          <AuthProvider>
-            <NotificationProvider>
-              <div className="flex flex-col min-h-screen">
-                <Navbar />
-                <div className="flex-1">{children}</div>
-                <Footer />
-              </div>
-              <ToastNotificationCenter />
-            </NotificationProvider>
-          </AuthProvider>
+          <DashboardThemeProvider>
+            <AuthProvider>
+              <FiatRatesProvider>
+                <NotificationProvider>
+                  <div className="flex flex-col min-h-screen">
+                    <Navbar />
+                    <div className="flex-1">{children}</div>
+                    <Footer />
+                  </div>
+                  <ToastNotificationCenter />
+                </NotificationProvider>
+              </FiatRatesProvider>
+            </AuthProvider>
+          </DashboardThemeProvider>
         </I18nProvider>
       </body>
     </html>

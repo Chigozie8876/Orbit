@@ -15,7 +15,7 @@ import {
 
 // relayer.js loads the SDK's CommonJS build; XDR values from its ESM build are different
 // classes and fail its type checks, so the tests must share the same copy
-const { Keypair, StrKey, Account, Networks, FeeBumpTransaction, authorizeInvocation } = createRequire(import.meta.url)('@stellar/stellar-sdk');
+const { Keypair, StrKey, Account, Networks, FeeBumpTransaction, authorizeInvocation, Asset, Operation, TransactionBuilder, BASE_FEE } = createRequire(import.meta.url)('@stellar/stellar-sdk');
 
 const CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32, 3));
 const LATEST_LEDGER = 500;
@@ -436,6 +436,38 @@ describe('Relay routes', () => {
     expect(mockSupabase.rpc).toHaveBeenCalledWith('acquire_billing_lock', expect.objectContaining({ p_subscription_id: validSubscriptionId }));
   });
 
+  // Reads a sample from the app's own /metrics scrape (#230)
+  const scrapeMetric = async (sample) => {
+    const previousToken = process.env.METRICS_TOKEN;
+    process.env.METRICS_TOKEN = 'test-metrics-token';
+    try {
+      const res = await request(app).get('/metrics').set('Authorization', 'Bearer test-metrics-token');
+      expect(res.status).toBe(200);
+      const escaped = sample.replace(/[{}"]/g, (c) => `\\${c}`);
+      const match = res.text.match(new RegExp(`^${escaped} (\\S+)$`, 'm'));
+      return match ? Number(match[1]) : 0;
+    } finally {
+      if (previousToken === undefined) delete process.env.METRICS_TOKEN;
+      else process.env.METRICS_TOKEN = previousToken;
+    }
+  };
+
+  it('counts each relayed pull and times its confirmation by outcome (#230)', async () => {
+    const successBefore = await scrapeMetric('orbit_pull_total{status="success"}');
+    const timedBefore = await scrapeMetric('orbit_pull_duration_seconds_count{status="success"}');
+
+    expect((await submit()).status).toBe(200);
+
+    expect(await scrapeMetric('orbit_pull_total{status="success"}')).toBe(successBefore + 1);
+    expect(await scrapeMetric('orbit_pull_duration_seconds_count{status="success"}')).toBe(timedBefore + 1);
+
+    const failedBefore = await scrapeMetric('orbit_pull_total{status="failed"}');
+    server.getTransaction.mockResolvedValue({ status: 'FAILED', resultXdr: { feeCharged: 120n } });
+    for (const limiter of Object.values(app.locals.rateLimiters)) limiter.reset();
+    expect((await submit()).status).toBe(502);
+    expect(await scrapeMetric('orbit_pull_total{status="failed"}')).toBe(failedBefore + 1);
+  });
+
   it('marks the subscription past_due when the relayed transaction fails on-chain', async () => {
     server.getTransaction.mockResolvedValue({ status: 'FAILED', resultXdr: { feeCharged: 120n } });
 
@@ -511,5 +543,36 @@ describe('Relay routes', () => {
 
     expect(res.status).toBe(503);
     expect(res.body.code).toBe('relayer_unavailable');
+  });
+
+  it('sponsors an atomic transaction on behalf of checkout widget (#169)', async () => {
+    const dummyKeypair = Keypair.random();
+    const sourceAccount = new Account(dummyKeypair.publicKey(), '100');
+    const innerTx = new TransactionBuilder(sourceAccount, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
+      .addOperation(Operation.payment({
+        destination: Keypair.random().publicKey(),
+        asset: Asset.native(),
+        amount: '1',
+      }))
+      .setTimeout(60)
+      .build();
+    innerTx.sign(dummyKeypair);
+
+    const res = await request(app)
+      .post('/relay/sponsor-transaction')
+      .send({ tx_xdr: innerTx.toXDR(), network_passphrase: Networks.TESTNET });
+
+    expect(res.status).toBe(200);
+    expect(res.body.sponsored).toBe(true);
+    expect(res.body.sponsorAddress).toBe(app.locals.relayer.sponsorAddress);
+  });
+
+  it('rejects sponsorship request with 400 when tx_xdr is missing', async () => {
+    const res = await request(app)
+      .post('/relay/sponsor-transaction')
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('tx_xdr is required');
   });
 });

@@ -8,7 +8,7 @@ on:
   pull_request:
     paths:
       - "contracts/soroban/**"
-      - ".github/workflows/soroban.yml"
+      - ".github/workflows/contract-ci.yml"
 
 permissions:
   contents: read
@@ -24,12 +24,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/soroban
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Unit and integration tests
-        run: cargo test --locked -j 2
+        run: cargo test --locked -j 2 -- --nocapture
       - name: Clippy
         run: cargo clippy --all-targets --locked -j 2 -- -D warnings
+      - name: Build WASM contract
+        run: cargo build --locked --target wasm32v1-none --release

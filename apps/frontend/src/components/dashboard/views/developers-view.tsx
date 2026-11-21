@@ -30,6 +30,7 @@ import Link from "next/link";
 import { useAuth } from "@/lib/auth-context";
 import { ApiKeyRecord, WebhookEndpoint, WebhookDeliveryLog } from "../dashboard-types";
 import { CreateApiKeyModal } from "../modals/create-api-key-modal";
+import { ApiPlayground } from "../api-playground";
 import { RegisterWebhookModal } from "../modals/register-webhook-modal";
 import { WebhookDeliveryDrawer } from "../drawers/webhook-delivery-drawer";
 import { DOCS_URL } from "@/lib/links";
@@ -41,6 +42,12 @@ import {
   resendWebhookDelivery,
   sendTestWebhook,
 } from "@/lib/api";
+import {
+  verifyWebhookSignature,
+  generateSignedWebhookTestBundle,
+  generateWebhookVerificationCode,
+  type WebhookVerifyLanguage,
+} from "@/lib/webhook-verifier";
 
 const INITIAL_KEYS: ApiKeyRecord[] = [
   {
@@ -214,12 +221,69 @@ export function DevelopersView() {
   const [isDeliveryDrawerOpen, setIsDeliveryDrawerOpen] = useState(false);
   const [deliveryFilter, setDeliveryFilter] = useState<"all" | "success" | "failed">("all");
   const [deliverySearch, setDeliverySearch] = useState("");
+  const [deliveryPage, setDeliveryPage] = useState(1);
+  const deliveryPageSize = 10;
   const [resendingId, setResendingId] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   // Code Snippet Tab
   const [codeLanguage, setCodeLanguage] = useState<"curl" | "typescript" | "python">("curl");
   const [copiedCode, setCopiedCode] = useState(false);
+
+  // Interactive Webhook Payload Signature Verifier (#182)
+  const [verifierSecret, setVerifierSecret] = useState<string>(
+    INITIAL_WEBHOOKS[0]?.signing_secret || "whsec_9482f3a7c1b0e4d28e7c9f0158b246"
+  );
+  const [verifierBundle] = useState(() =>
+    generateSignedWebhookTestBundle({
+      secret: INITIAL_WEBHOOKS[0]?.signing_secret || "whsec_9482f3a7c1b0e4d28e7c9f0158b246",
+      event: "payment.settled",
+    })
+  );
+  const [verifierRawBody, setVerifierRawBody] = useState<string>(verifierBundle.rawBody);
+  const [verifierSignatureHeader, setVerifierSignatureHeader] = useState<string>(
+    verifierBundle.signatureHeader
+  );
+  const [verifierLang, setVerifierLang] = useState<WebhookVerifyLanguage>("nodejs");
+  const [copiedVerifierCode, setCopiedVerifierCode] = useState(false);
+
+  const verificationBreakdown = verifyWebhookSignature({
+    signingSecret: verifierSecret,
+    rawBody: verifierRawBody,
+    signatureHeader: verifierSignatureHeader,
+  });
+
+  const verifierCodeSnippet = generateWebhookVerificationCode(verifierLang, verifierSecret);
+
+  const handleGenerateValidTestSignature = () => {
+    const bundle = generateSignedWebhookTestBundle({
+      secret: verifierSecret,
+      event: sandboxEvent || "payment.settled",
+    });
+    setVerifierRawBody(bundle.rawBody);
+    setVerifierSignatureHeader(bundle.signatureHeader);
+    showNotification("success", "Generated valid signed webhook payload & HMAC-SHA256 header.");
+  };
+
+  const handleSimulateExpiredSignature = () => {
+    const expiredTs = Math.floor(Date.now() / 1000) - 660; // 11 minutes old
+    const bundle = generateSignedWebhookTestBundle({
+      secret: verifierSecret,
+      event: sandboxEvent || "payment.settled",
+      timestampSeconds: expiredTs,
+    });
+    setVerifierRawBody(bundle.rawBody);
+    setVerifierSignatureHeader(bundle.signatureHeader);
+  };
+
+  const handleSimulateBodyMutation = () => {
+    try {
+      const compact = JSON.stringify(JSON.parse(verifierRawBody));
+      setVerifierRawBody(compact);
+    } catch {
+      setVerifierRawBody(verifierRawBody + " ");
+    }
+  };
 
   // Load real webhooks and deliveries from backend if user exists
   const loadWebhooksData = useCallback(async () => {
@@ -432,7 +496,11 @@ export function DevelopersView() {
     setResendingId(del.id);
     try {
       if (user?.id) {
-        await resendWebhookDelivery(del.id);
+        const result = await resendWebhookDelivery(del.id);
+        setDeliveries(prev => prev.map(item => item.id === del.id ? result.delivery : item));
+        setSelectedDelivery(prev => prev?.id === del.id ? result.delivery : prev);
+        showNotification("success", "Replay requested. Delivery status updated from the API.");
+        return;
       }
       await new Promise((r) => setTimeout(r, 600));
 
@@ -476,12 +544,16 @@ export function DevelopersView() {
   const filteredDeliveries = deliveries.filter((d) => {
     const matchesSearch =
       d.event_type.toLowerCase().includes(deliverySearch.toLowerCase()) ||
+      String(d.response_status ?? "").includes(deliverySearch.trim()) ||
       d.id.toLowerCase().includes(deliverySearch.toLowerCase()) ||
       (d.webhooks?.url || "").toLowerCase().includes(deliverySearch.toLowerCase());
 
     if (deliveryFilter === "all") return matchesSearch;
     return matchesSearch && d.status === deliveryFilter;
   });
+
+  const totalDeliveryPages = Math.max(1, Math.ceil(filteredDeliveries.length / deliveryPageSize));
+  const visibleDeliveries = filteredDeliveries.slice((Math.min(deliveryPage, totalDeliveryPages) - 1) * deliveryPageSize, Math.min(deliveryPage, totalDeliveryPages) * deliveryPageSize);
 
   // Code snippets
   const copySnippet = (text: string) => {
@@ -624,6 +696,7 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
                   <tr key={k.id} className="hover:bg-neutral-50/50 transition-colors">
                     <td className="py-3.5 px-4 font-semibold text-black">
                       {k.name}
+                      <div className="mt-1 flex flex-wrap gap-1">{(k.scopes ?? []).map(scope => <span key={scope} className={`rounded px-1.5 py-0.5 text-[10px] ${scope.endsWith(":admin") || scope.endsWith(":execute") ? "bg-amber-100 text-amber-800" : "bg-indigo-50 text-indigo-700"}`}>{scope}</span>)}</div>
                     </td>
 
                     <td className="py-3.5 px-4">
@@ -935,6 +1008,276 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
         )}
       </div>
 
+      {/* 4B. Interactive Webhook Payload Signature Verifier & Code Generator (#182) */}
+      <div className="rounded-xl border border-black/10 bg-white p-6 shadow-xs space-y-6">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-black/5">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-black/5 flex items-center justify-center text-black">
+              <ShieldCheck size={16} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base font-bold text-black tracking-tight">
+                  Interactive Webhook Payload Signature Verifier
+                </h3>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold">
+                  HMAC-SHA256
+                </span>
+              </div>
+              <p className="text-xs text-neutral-500">
+                Debug HMAC-SHA256 signature calculation step-by-step, diagnose replay window or body whitespace mismatches, and generate framework verification middleware.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleGenerateValidTestSignature}
+              className="button button-primary text-xs h-8 px-3 flex items-center gap-1.5 shadow-2xs"
+            >
+              <ShieldCheck size={12} />
+              <span>Generate Valid Test Payload &amp; Signature</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleSimulateExpiredSignature}
+              className="button button-secondary text-xs h-8 px-2.5"
+              title="Simulate a timestamp older than the 5-minute tolerance window"
+            >
+              Test Expired (&gt;5m)
+            </button>
+            <button
+              type="button"
+              onClick={handleSimulateBodyMutation}
+              className="button button-secondary text-xs h-8 px-2.5"
+              title="Simulate middleware JSON re-serialization / whitespace mutation"
+            >
+              Test Body Whitespace Issue
+            </button>
+          </div>
+        </div>
+
+        {/* Inputs: Signing Secret, Signature Header, Raw Request Body */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 text-xs">
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <label className="block font-semibold text-black uppercase tracking-wider">
+                1. Webhook Signing Secret (<code className="font-mono">whsec_...</code>)
+              </label>
+              <input
+                type="text"
+                value={verifierSecret}
+                onChange={(e) => setVerifierSecret(e.target.value)}
+                placeholder="whsec_9482f3a7c1b0e4d28e7c9f0158b246"
+                className="w-full rounded-lg border border-black/10 px-3.5 py-2 font-mono text-xs text-black"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block font-semibold text-black uppercase tracking-wider">
+                2. Signature Header (<code className="font-mono">X-Orbit-Signature</code>)
+              </label>
+              <input
+                type="text"
+                value={verifierSignatureHeader}
+                onChange={(e) => setVerifierSignatureHeader(e.target.value)}
+                placeholder="t=1729260000,v1=a89f0293b4c1..."
+                className="w-full rounded-lg border border-black/10 px-3.5 py-2 font-mono text-xs text-black"
+              />
+              <p className="text-[11px] text-neutral-400">
+                Supports <code className="font-mono">t=&lt;unix_ts&gt;,v1=&lt;hex&gt;</code> or <code className="font-mono">sha256=&lt;hex&gt;</code> formats.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="font-semibold text-black uppercase tracking-wider">
+                  3. Raw Request Body (Exact UTF-8 Bytes)
+                </label>
+                <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">
+                  Do not pretty-print or re-serialize before verifying
+                </span>
+              </div>
+              <textarea
+                rows={7}
+                value={verifierRawBody}
+                onChange={(e) => setVerifierRawBody(e.target.value)}
+                className="w-full rounded-lg bg-[#09090b] text-neutral-200 p-3.5 font-mono text-xs border border-neutral-800 focus:outline-hidden focus:ring-1 focus:ring-black"
+              />
+            </div>
+          </div>
+
+          {/* Step-by-Step Diagnostic Breakdown */}
+          <div className="space-y-4">
+            <div
+              className={`p-4 rounded-xl border space-y-2 ${
+                verificationBreakdown.isValid
+                  ? "bg-emerald-50/80 border-emerald-200 text-emerald-950"
+                  : verificationBreakdown.diagnosticCode === "TIMESTAMP_EXPIRED"
+                    ? "bg-amber-50/80 border-amber-200 text-amber-950"
+                    : "bg-red-50/80 border-red-200 text-red-950"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  {verificationBreakdown.isValid ? (
+                    <CheckCircle2 size={16} className="text-emerald-600 shrink-0" />
+                  ) : (
+                    <AlertCircle
+                      size={16}
+                      className={
+                        verificationBreakdown.diagnosticCode === "TIMESTAMP_EXPIRED"
+                          ? "text-amber-600 shrink-0"
+                          : "text-red-600 shrink-0"
+                      }
+                    />
+                  )}
+                  <span className="font-bold text-sm">
+                    {verificationBreakdown.diagnosticTitle}
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono font-bold uppercase px-2 py-0.5 rounded bg-white/80 border border-black/10">
+                  {verificationBreakdown.diagnosticCode}
+                </span>
+              </div>
+              <p className="text-xs leading-relaxed">
+                {verificationBreakdown.diagnosticMessage}
+              </p>
+            </div>
+
+            {/* Calculation Steps */}
+            <div className="rounded-xl border border-black/10 bg-neutral-50/60 p-4 space-y-3">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-neutral-500">
+                Step-by-Step HMAC-SHA256 Calculation Breakdown
+              </div>
+
+              <div className="space-y-2.5">
+                {verificationBreakdown.steps.map((step) => (
+                  <div
+                    key={step.stepNumber}
+                    className="p-2.5 rounded-lg bg-white border border-black/5 space-y-1"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-black">
+                        Step {step.stepNumber}: {step.title}
+                      </span>
+                      <span
+                        className={`text-[10px] font-mono font-bold uppercase px-1.5 py-0.5 rounded ${
+                          step.status === "pass"
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : "bg-red-50 text-red-700 border border-red-200"
+                        }`}
+                      >
+                        {step.status.toUpperCase()}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-neutral-600">{step.detail}</p>
+                    {step.value && (
+                      <div className="font-mono text-[10px] text-neutral-700 bg-neutral-100 px-2 py-1 rounded truncate">
+                        {step.value}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {verificationBreakdown.expectedDigestHex && (
+                <div className="pt-2 border-t border-black/5 space-y-1.5 text-[11px] font-mono">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-neutral-500">Expected HMAC:</span>
+                    <span className="text-black font-semibold truncate max-w-[260px]">
+                      {verificationBreakdown.expectedDigestHex}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-neutral-500">Provided Digest:</span>
+                    <span
+                      className={`font-semibold truncate max-w-[260px] ${
+                        verificationBreakdown.expectedDigestHex ===
+                        verificationBreakdown.providedDigestHex
+                          ? "text-emerald-700"
+                          : "text-red-600"
+                      }`}
+                    >
+                      {verificationBreakdown.providedDigestHex || "(none)"}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Multi-Language Verification Middleware Code Generator */}
+        <div className="pt-4 border-t border-black/5 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h4 className="text-sm font-bold text-black">
+                Multi-Language Verification Middleware Generator
+              </h4>
+              <p className="text-xs text-neutral-500">
+                Copy-pasteable constant-time HMAC-SHA256 verification snippets pre-configured with your signing secret ({verifierCodeSnippet.framework}).
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1 bg-neutral-100 p-0.5 rounded-lg">
+              {(["nodejs", "python", "go", "rust", "php", "ruby"] as const).map((lang) => {
+                const labels: Record<WebhookVerifyLanguage, string> = {
+                  nodejs: "Node.js",
+                  python: "Python",
+                  go: "Go",
+                  rust: "Rust",
+                  php: "PHP",
+                  ruby: "Ruby",
+                };
+                return (
+                  <button
+                    key={lang}
+                    type="button"
+                    onClick={() => setVerifierLang(lang)}
+                    className={`text-xs font-mono px-2.5 py-1 rounded-md transition-colors ${
+                      verifierLang === lang
+                        ? "bg-white text-black font-bold shadow-2xs"
+                        : "text-neutral-500 hover:text-black"
+                    }`}
+                  >
+                    {labels[lang]}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="relative rounded-lg bg-[#09090b] text-neutral-200 p-4 font-mono text-xs overflow-x-auto border border-neutral-800">
+            <button
+              type="button"
+              onClick={() => {
+                navigator.clipboard.writeText(verifierCodeSnippet.code);
+                setCopiedVerifierCode(true);
+                setTimeout(() => setCopiedVerifierCode(false), 2000);
+              }}
+              className="absolute right-3 top-3 button button-secondary text-xs h-7 px-2.5 bg-neutral-800 text-white hover:bg-neutral-700 border-neutral-700 flex items-center gap-1"
+            >
+              {copiedVerifierCode ? (
+                <>
+                  <Check size={11} className="text-emerald-400" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy size={11} />
+                  <span>Copy Snippet</span>
+                </>
+              )}
+            </button>
+            <pre className="leading-relaxed pr-24">
+              <code>{verifierCodeSnippet.code}</code>
+            </pre>
+          </div>
+        </div>
+      </div>
+
       {/* 5. Delivery Log Inspector */}
       <div className="rounded-xl border border-black/10 bg-white p-6 shadow-xs space-y-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-black/5">
@@ -1012,13 +1355,14 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
                 <th className="py-3 px-4">{t("deliveries.event")}</th>
                 <th className="py-3 px-4">{t("deliveries.endpoint")}</th>
                 <th className="py-3 px-4">{t("deliveries.dispatched")}</th>
+                <th className="py-3 px-4">Latency</th>
                 <th className="py-3 px-4">{t("deliveries.attempts")}</th>
                 <th className="py-3 px-4 text-right">{t("deliveries.actions")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-black/5 text-neutral-700">
               {filteredDeliveries.length > 0 ? (
-                filteredDeliveries.map((del) => {
+                visibleDeliveries.map((del) => {
                   const isSuccess = del.status === "success" || (del.response_status && del.response_status >= 200 && del.response_status < 300);
                   const isResendingThis = resendingId === del.id;
 
@@ -1058,6 +1402,7 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
                         {new Date(del.created_at).toLocaleTimeString()} · {new Date(del.created_at).toLocaleDateString()}
                       </td>
 
+                      <td className="py-3 px-4 font-mono text-[11px]">{typeof del.latency_ms === "number" ? `${del.latency_ms}ms` : "—"}</td>
                       <td className="py-3 px-4 font-mono text-[11px]">
                         #{del.attempt_count}
                       </td>
@@ -1095,7 +1440,7 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
                 })
               ) : (
                 <tr>
-                  <td colSpan={6} className="py-8 text-center text-neutral-500 text-xs">
+                  <td colSpan={7} className="py-8 text-center text-neutral-500 text-xs">
                     No delivery records match your filter.
                   </td>
                 </tr>
@@ -1105,6 +1450,13 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
         </div>
       </div>
 
+      <div className="flex items-center justify-between gap-3 text-xs text-neutral-600">
+        <span>Delivery page {Math.min(deliveryPage, totalDeliveryPages)} of {totalDeliveryPages} ({filteredDeliveries.length} entries)</span>
+        <div className="flex gap-2">
+          <button className="button button-secondary px-3 py-2 disabled:opacity-40" disabled={deliveryPage <= 1} onClick={() => setDeliveryPage(p => Math.max(1, p - 1))}>Previous</button>
+          <button className="button button-secondary px-3 py-2 disabled:opacity-40" disabled={deliveryPage >= totalDeliveryPages} onClick={() => setDeliveryPage(p => Math.min(totalDeliveryPages, p + 1))}>Next</button>
+        </div>
+      </div>
       {/* 6. Interactive Programmatic Usage API Snippets */}
       <div className="rounded-xl border border-black/10 bg-white p-6 shadow-xs space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-black/5">
@@ -1170,6 +1522,7 @@ print(f"Settled on Stellar: {pull.tx_hash}")`;
         </div>
       </div>
 
+      <ApiPlayground keys={keys} />
       {/* Modals & Drawers */}
       <CreateApiKeyModal
         isOpen={isCreateKeyModalOpen}

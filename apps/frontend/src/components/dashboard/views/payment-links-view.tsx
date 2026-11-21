@@ -14,8 +14,9 @@ import {
   Clock,
   Sparkles,
 } from "lucide-react";
+import { PriceDisplay } from "@/components/ui/price-display";
 import { PaymentLink } from "../dashboard-types";
-import { CreatePaymentLinkModal } from "../modals/create-payment-link-modal";
+import { CreatePaymentLinkModal, HostedLink } from "../modals/create-payment-link-modal";
 import { PreviewLinkModal } from "../modals/preview-link-modal";
 
 interface PaymentLinksViewProps {
@@ -72,8 +73,25 @@ export function PaymentLinksView({ businessName }: PaymentLinksViewProps) {
   const [previewLink, setPreviewLink] = useState<PaymentLink | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const handleCreateLink = (newLink: PaymentLink) => {
-    setLinks((prev) => [newLink, ...prev]);
+  const handleCreateLink = (link: HostedLink | PaymentLink) => {
+    if ("amount" in link) {
+      setLinks((prev) => [link, ...prev]);
+    } else {
+      const mapped: PaymentLink = {
+        id: link.id,
+        title: link.title,
+        amount: link.plans?.usdc_amount ? Number(link.plans.usdc_amount) / 1e7 : 50.0,
+        currency: link.plans?.currency || "USDC",
+        type: "recurring",
+        intervalDays: link.plans?.interval_seconds ? Math.round(link.plans.interval_seconds / 86400) : 30,
+        url: typeof window !== "undefined" ? `${window.location.origin}/pay/${link.id}` : `https://orbit.network/pay/${link.id}`,
+        clicks: 0,
+        conversions: 0,
+        network: "stellar-testnet",
+        status: "active",
+      };
+      setLinks((prev) => [mapped, ...prev]);
+    }
   };
 
   const copyUrl = (rawUrl: string, id: string) => {
@@ -138,8 +156,7 @@ export function PaymentLinksView({ businessName }: PaymentLinksViewProps) {
             Collected Volume
           </div>
           <div className="text-2xl font-bold text-emerald-600 mt-1">
-            {totalCollected.toLocaleString("en-US", { minimumFractionDigits: 2 })}{" "}
-            <span className="text-xs font-mono font-bold text-neutral-500">USDC</span>
+            <PriceDisplay amount={totalCollected} />
           </div>
           <div className="text-xs text-neutral-500 mt-0.5">
             100% direct to your treasury
