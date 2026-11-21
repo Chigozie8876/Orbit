@@ -78,6 +78,7 @@ const { registerPrivacyRoutes } = require('./privacy');
 const { createUsageBufferFromEnv, registerUsageRoutes, rollupUsage } = require('./usage-meter');
 const { registerCohortRoutes } = require('./cohorts');
 const { registerNotificationTemplateRoutes } = require('./notification-templates');
+const { registerBalanceReminderRoutes } = require('./balance-reminders');
 const { registerProofRoutes } = require('./proofs');
 const { registerOrganizationRoutes } = require('./organizations');
 const { registerRpcProxyRoute } = require('./rpc-proxy');
@@ -2132,6 +2133,7 @@ registerPrivacyRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerUsageRoutes(app, { getSupabase, authenticateMerchant, getBuffer: getUsageBuffer });
 registerCohortRoutes(app, getSupabase, authenticateMerchant);
 registerNotificationTemplateRoutes(app, getSupabase, authenticateMerchant);
+registerBalanceReminderRoutes(app, { getSupabase, authenticateMerchant });
 registerProofRoutes(app, { getPrimarySupabase, authenticateMerchant });
 registerSigningSessionRoutes(app, getSupabase, authenticateMerchant);
 
