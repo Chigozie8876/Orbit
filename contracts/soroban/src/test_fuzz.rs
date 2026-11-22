@@ -121,7 +121,7 @@ fn fuzz_invariant_solvency_escrow_and_streams() {
             let idx = (rng.next_u64() as usize) % escrow_count;
             let pid = tracked_escrow_ids[idx];
             let pct = rng.range_u64(0, 100) as u32;
-            let _ = client.try_resolve_dispute(&arbitrator, &pid, &pct);
+            let _ = client.try_resolve_pull_dispute(&arbitrator, &pid, &pct);
         } else if action == 3 && escrow_count > 0 {
             let idx = (rng.next_u64() as usize) % escrow_count;
             let pid = tracked_escrow_ids[idx];

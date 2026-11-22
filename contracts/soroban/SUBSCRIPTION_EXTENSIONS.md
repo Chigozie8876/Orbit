@@ -75,7 +75,7 @@ Orbit and create an indexed `EscrowHold`, beginning at `pull_id = 0`.
 The `escrow_held` event contains the pull ID and amount. A subscriber
 may call `raise_dispute(user, merchant, pull_id)` before the release
 timestamp. The designated arbitrator calls
-`resolve_dispute(arbitrator, pull_id, refund_percentage)`, with
+`resolve_pull_dispute(arbitrator, pull_id, refund_percentage)`, with
 `refund_percentage` between 0 and 100 inclusive, to split funds.
 An undisputed hold becomes claimable by the merchant using
 `claim_escrow_funds(merchant, pull_id)` once the window expires.
