@@ -25,6 +25,7 @@ import {
   Lock,
   ArrowRight,
   Shield,
+  Calculator,
 } from "lucide-react";
 import { connectFreighter } from "@/lib/freighter";
 import { signMessage } from "@stellar/freighter-api";
@@ -38,6 +39,8 @@ import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRe
 import { simulatePayrollRun } from "@/lib/payroll-simulation";
 import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
 import { MilestonePayrollPanel } from "./milestone-payroll-panel";
+import { SplitCalculator } from "../split-calculator";
+import { StreamingPayrollPanel } from "./streaming-payroll-panel";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -83,6 +86,12 @@ interface RowValidationError {
   reason: string;
 }
 
+export interface PayrollViewProps {
+  autoOpenUpload?: boolean;
+  onUploadOpened?: () => void;
+}
+
+export function PayrollView({ autoOpenUpload, onUploadOpened }: PayrollViewProps = {}) {
 export interface MultiSigSigner {
   address: string;
   name: string;
@@ -131,6 +140,7 @@ export function PayrollView() {
   const [uploadErrors, setUploadErrors] = useState<RowValidationError[]>([]);
   const [editedAmounts, setEditedAmounts] = useState<Record<string, string>>({});
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [showSplitCalculator, setShowSplitCalculator] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const duplicates = useMemo(() => duplicateWallets(recipients), [recipients]);
   const preflightErrors = useMemo(() => {
@@ -309,6 +319,14 @@ export function PayrollView() {
   };
 
   useEffect(() => {
+    if (autoOpenUpload) {
+      // Trigger file picker for payroll CSV upload
+      fileInputRef.current?.click();
+      onUploadOpened?.();
+    }
+  }, [autoOpenUpload, onUploadOpened]);
+
+  useEffect(() => {
     setContractors([]); setBookError("");
     if (!addressBookKey) return;
     try {
@@ -360,6 +378,26 @@ export function PayrollView() {
     setDisbursedSuccess(null);
     setUploadErrors([]);
     setEditedAmounts({});
+  };
+
+  const handleExportCleanedCsv = () => {
+    if (preflightErrors.size || uploadErrors.length || recipients.length === 0) return;
+    const csv = Papa.unparse(recipients.map((row) => ({
+      Name: row.name.trim(), Role: row.role.trim(), StellarWallet: row.walletAddress.trim(),
+      AmountUSDC: editedAmounts[row.id] ?? String(row.amount),
+    })));
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a"); link.href = url; link.download = "orbit_payroll_cleaned.csv"; link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const gridKeyDown = (event: React.KeyboardEvent<HTMLInputElement>, row: number, col: number) => {
+    const keys: Record<string, [number, number]> = {
+      ArrowUp: [row - 1, col], ArrowDown: [row + 1, col], ArrowLeft: [row, col - 1], ArrowRight: [row, col + 1], Enter: [row + 1, col],
+    };
+    const next = keys[event.key]; if (!next) return;
+    const target = document.querySelector<HTMLInputElement>(`[data-grid-row="${next[0]}"][data-grid-col="${next[1]}"]`);
+    if (target) { event.preventDefault(); target.focus(); target.select(); }
   };
 
   const handleDownloadTemplate = () => {
@@ -558,6 +596,9 @@ export function PayrollView() {
   return (
     <div className="space-y-6">
       <MilestonePayrollPanel canRunPayroll={canRunPayroll} />
+
+      {/* Live streaming payroll balances (#291) */}
+      <StreamingPayrollPanel />
 
       {/* Sub-tab Switcher: Direct Batch vs Pending Approvals (Multi-Sig Queue) (#250) */}
       <div className="flex items-center gap-2 border-b border-black/10 pb-2">
@@ -997,6 +1038,15 @@ export function PayrollView() {
             <span>Template</span>
           </button>
           <button
+            onClick={handleExportCleanedCsv}
+            disabled={preflightErrors.size > 0 || uploadErrors.length > 0 || recipients.length === 0}
+            className="button button-secondary text-xs h-9 px-3 flex items-center gap-1.5 disabled:opacity-50"
+            title="Export the corrected, validated payroll CSV"
+          >
+            <FileSpreadsheet size={13} />
+            <span>Export Clean CSV</span>
+          </button>
+          <button
             onClick={() => setIsAddingManual(true)}
             className="button button-secondary text-xs h-9 px-3 flex items-center gap-1.5"
           >
@@ -1018,8 +1068,32 @@ export function PayrollView() {
           >
             Reset Demo
           </button>
+          <button
+            onClick={() => setShowSplitCalculator((prev) => !prev)}
+            className={`button text-xs h-9 px-3 flex items-center gap-1.5 transition-all ${
+              showSplitCalculator
+                ? "bg-indigo-600 text-white border-indigo-700 shadow-xs"
+                : "button-secondary"
+            }`}
+            title="Toggle interactive team split calculator"
+          >
+            <Calculator size={13} />
+            <span>Split Calculator</span>
+          </button>
         </div>
       </div>
+
+      {/* Interactive Split Calculator */}
+      {showSplitCalculator && (
+        <SplitCalculator
+          onApplyToBatch={(newRecipients) => {
+            setRecipients(newRecipients);
+            setDisbursedSuccess(null);
+            setUploadErrors([]);
+            setEditedAmounts({});
+          }}
+        />
+      )}
 
       {/* Success Notification Banner */}
       {disbursedSuccess && (
@@ -1258,20 +1332,20 @@ export function PayrollView() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-black/5 text-neutral-700">
-                {visibleRecipients.map((rec) => (
+                {visibleRecipients.map((rec, rowIndex) => (
                   <tr key={rec.id} className={preflightErrors.has(rec.id) ? "bg-red-50" : "hover:bg-neutral-50/50 transition-colors"}>
                     <td className="py-4 px-5 font-semibold text-black">
-                      <input aria-label="Recipient name" value={rec.name} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "name", e.target.value)} className="w-32 rounded border border-black/10 p-2" />
+                      <input aria-label="Recipient name" data-grid-row={rowIndex} data-grid-col={0} onKeyDown={e => gridKeyDown(e,rowIndex,0)} title={preflightErrors.get(rec.id)?.find(x=>x.includes("name"))} value={rec.name} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "name", e.target.value)} className={`w-32 rounded border p-2 ${preflightErrors.get(rec.id)?.some(x=>x.includes("name"))?"border-red-400 bg-red-50":"border-black/10"}`} />
                       {preflightErrors.has(rec.id) && <div role="alert" className="text-red-700 text-[10px]">{preflightErrors.get(rec.id)?.join("; ")}</div>}
                     </td>
 
                     <td className="py-4 px-4 text-neutral-600">
-                      <input aria-label="Recipient role" value={rec.role} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "role", e.target.value)} className="w-28 rounded border border-black/10 p-2" />
+                      <input aria-label="Recipient role" data-grid-row={rowIndex} data-grid-col={1} onKeyDown={e => gridKeyDown(e,rowIndex,1)} value={rec.role} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "role", e.target.value)} className="w-28 rounded border border-black/10 p-2" />
                     </td>
 
                     <td className="py-4 px-4">
                       <div className="flex items-center gap-1.5">
-                        <input aria-label="Stellar wallet" value={rec.walletAddress} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "walletAddress", e.target.value)} className="w-52 rounded border border-black/10 p-2 font-mono" />
+                        <input aria-label="Stellar wallet" data-grid-row={rowIndex} data-grid-col={2} onKeyDown={e => gridKeyDown(e,rowIndex,2)} title={preflightErrors.get(rec.id)?.find(x=>x.toLowerCase().includes("wallet")||x.toLowerCase().includes("stellar")||x.toLowerCase().includes("address"))} value={rec.walletAddress} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "walletAddress", e.target.value)} className={`w-52 rounded border p-2 font-mono ${preflightErrors.get(rec.id)?.some(x=>/wallet|stellar|address/i.test(x))?"border-red-400 bg-red-50":"border-black/10"}`} />
                         <button
                           onClick={() => copyToClipboard(rec.walletAddress, rec.id)}
                           className="p-1 rounded hover:bg-black/5 text-neutral-400 hover:text-black transition-colors"
@@ -1296,7 +1370,7 @@ export function PayrollView() {
                     </td>
 
                     <td className="py-4 px-4 font-mono font-bold text-black text-sm">
-                      <input aria-label="USDC amount" inputMode="decimal" value={editedAmounts[rec.id] ?? String(rec.amount)} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "amount", e.target.value)} className="w-24 rounded border border-black/10 p-2" />
+                      <input aria-label="USDC amount" data-grid-row={rowIndex} data-grid-col={3} onKeyDown={e => gridKeyDown(e,rowIndex,3)} title={preflightErrors.get(rec.id)?.find(x=>x.toLowerCase().includes("amount"))} inputMode="decimal" value={editedAmounts[rec.id] ?? String(rec.amount)} disabled={rec.status === "disbursed"} onChange={e => editRecipient(rec.id, "amount", e.target.value)} className={`w-24 rounded border p-2 ${preflightErrors.get(rec.id)?.some(x=>x.toLowerCase().includes("amount"))?"border-red-400 bg-red-50":"border-black/10"}`} />
                     </td>
 
                     <td className="py-4 px-4">

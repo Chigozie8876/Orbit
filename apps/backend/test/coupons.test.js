@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import app from '../index.js';
-import { calculateDiscount, couponIsValid } from '../coupons.js';
+import { calculateDiscount, couponIsValid, couponUnavailableReason } from '../coupons.js';
 import { makeApiKey } from './helpers.js';
 
 const merchantId = '7f8b9a10-b2c3-4d5e-a6f7-112233445566';
@@ -123,5 +123,55 @@ describe('Coupon merchant management and checkout', () => {
         couponsQuery.maybeSingle.mockResolvedValueOnce({ data: { ...coupon, redemptions_count: 2 }, error: null });
         const response = await request(app).post('/coupons/validate').send({ plan_id: planId, code: 'WELCOME20' });
         expect(response.status).toBe(422);
+    });
+
+    describe('POST /api/promo/validate (#299)', () => {
+        const validate = (code = 'WELCOME20') => request(app).post('/api/promo/validate').send({ plan_id: planId, code });
+
+        it('returns the same quote as /coupons/validate', async () => {
+            const response = await validate('welcome20');
+            expect(response.status).toBe(200);
+            expect(response.body).toMatchObject({ valid: true, code: 'WELCOME20', discounted_amount: 232000000, duration_months: 3 });
+        });
+        it('explains an unknown code', async () => {
+            couponsQuery.maybeSingle.mockResolvedValueOnce({ data: null, error: null });
+            const response = await validate('NOPE');
+            expect(response.status).toBe(422);
+            expect(response.body).toEqual({ valid: false, reason: 'invalid', error: 'This promo code is not valid.' });
+        });
+        it('explains an expired code', async () => {
+            couponsQuery.maybeSingle.mockResolvedValueOnce({ data: { ...coupon, expires_at: '2020-01-01T00:00:00Z' }, error: null });
+            const response = await validate();
+            expect(response.status).toBe(422);
+            expect(response.body).toMatchObject({ valid: false, reason: 'expired', error: 'This promo code has expired.' });
+        });
+        it('explains a code that is used up', async () => {
+            couponsQuery.maybeSingle.mockResolvedValueOnce({ data: { ...coupon, redemptions_count: 2 }, error: null });
+            expect((await validate()).body.reason).toBe('exhausted');
+        });
+        it('explains a code that cannot discount this plan', async () => {
+            couponsQuery.maybeSingle.mockResolvedValueOnce({ data: { ...coupon, discount_type: 'amount', discount_value: 999999999999 }, error: null });
+            expect((await validate()).body.reason).toBe('not_applicable');
+        });
+        it('treats another merchant\'s code as invalid', async () => {
+            couponsQuery.maybeSingle.mockResolvedValueOnce({ data: { ...coupon, merchant_id: otherMerchant }, error: null });
+            expect((await validate()).body.reason).toBe('invalid');
+        });
+        it('rejects a malformed code without querying', async () => {
+            const response = await validate('!!');
+            expect(response.status).toBe(400);
+            expect(response.body.reason).toBe('invalid');
+        });
+    });
+});
+
+describe('couponUnavailableReason (#299)', () => {
+    const base = { active: true, expires_at: null, max_redemptions: 2, redemptions_count: 1 };
+    it('classifies why a coupon cannot be redeemed', () => {
+        expect(couponUnavailableReason(base)).toBeNull();
+        expect(couponUnavailableReason(null)).toBe('invalid');
+        expect(couponUnavailableReason({ ...base, active: false })).toBe('invalid');
+        expect(couponUnavailableReason({ ...base, expires_at: '2020-01-01T00:00:00Z' })).toBe('expired');
+        expect(couponUnavailableReason({ ...base, redemptions_count: 2 })).toBe('exhausted');
     });
 });

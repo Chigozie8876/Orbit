@@ -63,22 +63,23 @@ const simulate = async (server, transaction) => {
   return result;
 };
 
-const buildPlanTransactions = ({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence, billingCycles }) => {
+const buildPlanTransactions = ({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence, billingCycles, baseFee = BASE_FEE }) => {
   const allowance = BigInt(amount) * BigInt(billingCycles);
   const ledgersPerCycle = Math.ceil(Number(intervalSeconds) / 5);
   const liveUntilLedger = Number(ledgerSequence) + Math.max(120960, ledgersPerCycle * billingCycles + 120960);
   const token = new Contract(tokenContractId);
-  const approve = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+  const approve = new TransactionBuilder(account, { fee: baseFee, networkPassphrase })
     .addOperation(token.call('approve', Address.fromString(address).toScVal(), Address.fromString(orbitContractId).toScVal(), nativeToScVal(allowance, { type: 'i128' }), nativeToScVal(liveUntilLedger, { type: 'u32' })))
     .setTimeout(60)
     .build();
-  const createVault = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+  const createVault = new TransactionBuilder(account, { fee: baseFee, networkPassphrase })
     .addOperation(new Contract(orbitContractId).call('create_vault', Address.fromString(address).toScVal(), Address.fromString(merchantAddress).toScVal(), Address.fromString(tokenContractId).toScVal(), nativeToScVal(BigInt(amount), { type: 'i128' }), nativeToScVal(BigInt(intervalSeconds), { type: 'u64' })))
     .setTimeout(60)
     .build();
   return { approve, createVault };
 };
 
+export async function preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
 /**
  * Builds an atomic batch transaction bundling token trustline (if needed), allowance approval,
  * and vault creation into a single transaction invocation (#169).
@@ -97,6 +98,7 @@ export const buildAtomicPlanTransaction = ({
   includeTrustline = false,
   assetCode = 'USDC',
   assetIssuer = null,
+  baseFee = BASE_FEE,
 }) => {
   const allowance = BigInt(amount) * BigInt(billingCycles);
   const ledgersPerCycle = Math.ceil(Number(intervalSeconds) / 5);
@@ -105,7 +107,7 @@ export const buildAtomicPlanTransaction = ({
   const token = new Contract(tokenContractId);
   const orbit = new Contract(orbitContractId);
 
-  const builder = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase });
+  const builder = new TransactionBuilder(account, { fee: baseFee, networkPassphrase });
 
   // 1. Optional token trustline creation for classic/SAC asset
   if (includeTrustline && assetIssuer) {
@@ -144,7 +146,9 @@ export const buildAtomicPlanTransaction = ({
 };
 
 /**
- * Submits a transaction through the backend gas relayer for fee sponsorship (#169).
+ * Submits a transaction through the backend gas relayer for fee sponsorship (#169, #297).
+ * The relayer only sponsors vault-creation transactions that pass its policy; anything it
+ * refuses falls back to direct submission, paid by the subscriber.
  */
 export async function submitSponsoredTransaction({
   server,
@@ -154,11 +158,11 @@ export async function submitSponsoredTransaction({
 }) {
   if (apiUrl) {
     try {
-      const res = await fetch(`${apiUrl}/relay/sponsor-transaction`, {
+      const res = await fetch(`${apiUrl}/api/relayer/sponsor`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tx_xdr: transaction.toXDR(),
+          signed_tx_xdr: transaction.toXDR(),
           network_passphrase: networkPassphrase,
         }),
       });
@@ -183,17 +187,20 @@ export async function submitSponsoredTransaction({
   return { hash: submission.hash, sponsored: false };
 }
 
-export async function preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000 }) {
+export async function preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles = 12, minimumXlmBalanceStroops = 1_000_000, baseFee = BASE_FEE }) {
   if (!orbitContractId || !tokenContractId) throw new Error('Missing Orbit or token contract configuration.');
   const server = new rpc.Server(rpcUrl);
+  if (wallet?.ensureAccountDeployed) {
+    await wallet.ensureAccountDeployed(server, rpcUrl);
+  }
   const account = await server.getAccount(address);
   const ledger = await server.getLatestLedger();
-  const transactions = buildPlanTransactions({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: ledger.sequence, billingCycles });
+  const transactions = buildPlanTransactions({ account, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: ledger.sequence, billingCycles, baseFee });
   const [balanceResult, approveSimulation, vaultSimulation] = await Promise.all([simulate(server, makeBalanceTransaction(account, tokenContractId, address, networkPassphrase)), simulate(server, transactions.approve), simulate(server, transactions.createVault)]);
   const usdcBalance = BigInt(scValToNative(balanceResult.result.retval));
   const xlmBalance = BigInt(account.balance || 0);
-  const approveFee = BigInt(approveSimulation.minResourceFee || approveSimulation.result?.minResourceFee || BASE_FEE);
-  const vaultFee = BigInt(vaultSimulation.minResourceFee || vaultSimulation.result?.minResourceFee || BASE_FEE);
+  const approveFee = BigInt(approveSimulation.minResourceFee || approveSimulation.result?.minResourceFee || baseFee);
+  const vaultFee = BigInt(vaultSimulation.minResourceFee || vaultSimulation.result?.minResourceFee || baseFee);
   const estimatedFeeStroops = approveFee + vaultFee;
   if (usdcBalance < BigInt(amount)) throw new Error(`Insufficient USDC balance. You need ${(Number(amount) / 10_000_000).toFixed(2)} USDC plus network fees. Top up this wallet and try again.`);
   if (xlmBalance < estimatedFeeStroops + BigInt(minimumXlmBalanceStroops)) throw new Error(`Insufficient XLM for network fees. Keep at least ${(Number(estimatedFeeStroops + BigInt(minimumXlmBalanceStroops)) / 10_000_000).toFixed(4)} XLM in this wallet, then try again.`);
@@ -219,6 +226,7 @@ export async function authorizePlanAtomic({
   includeTrustline = false,
   assetCode = 'USDC',
   assetIssuer = null,
+  baseFee = BASE_FEE,
   onSubmitted,
   onProgress,
 }) {
@@ -240,6 +248,7 @@ export async function authorizePlanAtomic({
     includeTrustline,
     assetCode,
     assetIssuer,
+    baseFee,
   });
 
   const prepared = await server.prepareTransaction(atomicTx);
@@ -285,16 +294,18 @@ export async function authorizePlan({
   rpcUrl,
   networkPassphrase,
   billingCycles = 12,
+  baseFee = BASE_FEE,
   preflight,
   onSubmitted,
   onProgress,
 }) {
-  const details = preflight || await preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles });
+  const details = preflight || await preflightPlan({ address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles, baseFee });
+  const details = preflight || await preflightPlan({ wallet, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, rpcUrl, networkPassphrase, billingCycles });
   const { server, transactions } = details;
   const approvalHash = await signAndSubmit({ server, transaction: transactions.approve, wallet, address, networkPassphrase, stage: 'approval', onSubmitted, onProgress });
 
   const refreshedAccount = await server.getAccount(address);
-  const refreshedTransactions = buildPlanTransactions({ account: refreshedAccount, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: (await server.getLatestLedger()).sequence, billingCycles });
+  const refreshedTransactions = buildPlanTransactions({ account: refreshedAccount, address, merchantAddress, amount, intervalSeconds, orbitContractId, tokenContractId, networkPassphrase, ledgerSequence: (await server.getLatestLedger()).sequence, billingCycles, baseFee });
   const vaultHash = await signAndSubmit({ server, transaction: refreshedTransactions.createVault, wallet, address, networkPassphrase, stage: 'vault', onSubmitted, onProgress });
   return { approvalHash, vaultHash };
 }

@@ -48,6 +48,8 @@ export default function DunningWorkflowView() {
   const [notice, setNotice] = useState("");
   const [funnel, setFunnel] = useState<RecoveryFunnel | null>(null);
   const [funnelError, setFunnelError] = useState("");
+  const [testingEmail, setTestingEmail] = useState(false);
+  const gracePeriod = Math.max(...steps.map((step) => step.day));
 
   const validationErrors = useMemo(() => validateDunningSteps(steps), [steps]);
   const dirty = JSON.stringify(steps) !== JSON.stringify(savedSteps);
@@ -129,6 +131,25 @@ export default function DunningWorkflowView() {
     const next = removeDunningStep(steps, selected);
     setSteps(next);
     setSelected(Math.max(0, Math.min(selected, next.length - 1)));
+  };
+
+  const setGracePeriod = (days: number) => {
+    setSteps((current) => current.map((step, index) =>
+      index === current.length - 1 ? { ...step, day: Math.max(days, index + 1) } : step
+    ));
+  };
+
+  const sendTestEmail = async () => {
+    setTestingEmail(true); setError(""); setNotice("");
+    try {
+      const response = await fetch(`${ORBIT_API_URL}/notification-templates/payment_failed/test`, {
+        method: "POST", headers: merchantRequestHeaders(),
+      });
+      if (!response.ok) throw new Error(await readError(response, "Could not send test email."));
+      setNotice("Test email accepted by the configured provider.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not send test email.");
+    } finally { setTestingEmail(false); }
   };
 
   if (loading) {
@@ -274,6 +295,11 @@ export default function DunningWorkflowView() {
         </div>
       </section>
 
+      <section aria-label="Grace period" className="rounded-lg border bg-white p-4">
+        <div className="flex items-center justify-between"><div><h3 className="text-sm font-semibold">Customer grace period</h3><p className="text-xs text-neutral-500">Final recovery action occurs on day {gracePeriod}.</p></div><span className="font-mono text-sm">{gracePeriod} days</span></div>
+        <input aria-label="Grace period days" type="range" min={1} max={30} value={gracePeriod} onChange={(e) => setGracePeriod(Number(e.target.value))} className="mt-4 w-full" />
+      </section>
+
       {/* Save */}
       <section aria-label="Save workflow" className="space-y-3">
         {validationErrors.length > 0 && (
@@ -283,14 +309,20 @@ export default function DunningWorkflowView() {
         )}
         {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
         {notice && <p role="status" className="text-sm text-green-700">{notice}</p>}
-        <button
-          type="button"
-          onClick={save}
-          disabled={saving || !dirty}
-          className="rounded bg-indigo-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
-        >
-          {saving ? "Saving..." : "Save workflow"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={save}
+            disabled={saving || !dirty}
+            className="rounded bg-indigo-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+          >
+            {saving ? "Saving..." : "Save workflow"}
+          </button>
+          <button type="button" onClick={sendTestEmail} disabled={testingEmail}
+            className="rounded border px-4 py-2 text-sm font-semibold disabled:opacity-50">
+            {testingEmail ? "Sending..." : "Send test email"}
+          </button>
+        </div>
       </section>
 
       {/* Recovery funnel */}

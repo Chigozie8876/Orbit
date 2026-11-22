@@ -105,6 +105,7 @@ pub struct VaultData {
 pub struct PaymentSplit {
     pub recipient: Address,        // payroll recipient
     pub amount: i128,              // raw units to send
+    pub token: Address,            // per-split settlement token
 }
 ```
 
@@ -176,7 +177,7 @@ stellar contract invoke \
   batch_disburse \
   --sender $MERCHANT_ADDR \
   --token $TOKEN \
-  --splits '[{"recipient":"'$ALICE'","amount":"100000000"},{"recipient":"'$BOB'","amount":"50000000"}]'
+  --splits '[{"recipient":"'$ALICE'","amount":"100000000","token":"'$TOKEN'"},{"recipient":"'$BOB'","amount":"50000000","token":"'$TOKEN'"}]'
 ```
 
 ### Run the App

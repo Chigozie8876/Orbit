@@ -3,8 +3,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 /// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
@@ -27,6 +27,51 @@ pub const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 3 * 24 * 60 * 60;
 pub const PAYMENT_ACTIVE: u32 = 0;
 pub const PAYMENT_GRACE_PERIOD: u32 = 1;
 pub const PAYMENT_DEFAULTED: u32 = 2;
+/// Terminal state once a vault's ledger expiration or lifetime cap is reached.
+pub const PAYMENT_EXPIRED: u32 = 3;
+
+/// Explicit unbounded sentinels: ledger 0 is never reached by a live network,
+/// and -1 is the only negative lifetime cap accepted by validation.
+pub const UNLIMITED_EXPIRATION_LEDGER: u32 = 0;
+pub const UNLIMITED_LIFETIME_CAP: i128 = -1;
+
+/// Domain separator for the canonical Merkle reward leaf preimage.
+pub const REWARD_LEAF_DOMAIN: &[u8] = b"orbit:reward:leaf:v1";
+
+/// Structured errors for the #300/#302 features. Existing entrypoints keep
+/// their historical assertion messages; new guards expose stable codes.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum OrbitContractError {
+    InvalidMerkleProof = 300,
+    AlreadyClaimed = 301,
+    MissingMerkleRoot = 302,
+    InvalidRewardAmount = 303,
+    UnauthorizedRootUpdate = 304,
+    InvalidMerkleRoot = 305,
+    VaultExpired = 306,
+    LifetimeCapExceeded = 307,
+    InvalidVaultLimit = 308,
+    /// #223: fund-moving entrypoints are disabled by the circuit breaker.
+    EmergencyPaused = 309,
+    /// #226: a pull would breach the rolling-window cumulative cap.
+    RateLimitExceeded = 310,
+    /// #226: invalid window duration or cumulative ceiling.
+    InvalidRateLimit = 311,
+    /// #224: fee basis points exceed the 10% ceiling.
+    InvalidFeeConfig = 312,
+    /// #223: caller is not the configured protocol admin.
+    UnauthorizedAdmin = 313,
+    /// #225: malformed milestone escrow configuration.
+    InvalidMilestoneEscrow = 314,
+    /// #225: milestone already released or escrow finalized.
+    MilestoneAlreadyReleased = 315,
+    /// #225: dispute resolution attempted on a non-disputed escrow.
+    MilestoneNotDisputed = 316,
+    /// #225: dispute splits do not add up to the remaining balance.
+    InvalidDisputeSplit = 317,
+}
 
 /// Sentinel `pull_sequence` for a vault that has never settled a pull.
 /// Lets the very first pull through while every later pull must advance the
@@ -60,6 +105,16 @@ pub const MAX_OVERDRAFT_PERCENTAGE: u32 = 20;
 /// Challenge period between recovery initiation and execution.
 pub const RECOVERY_TIMELOCK_SECONDS: u64 = 14 * 24 * 60 * 60;
 
+/// #224: maximum protocol treasury fee, in basis points (10%).
+pub const MAX_PROTOCOL_FEE_BPS: u32 = 1_000;
+
+/// #223: safety window after an emergency pause before a vault owner may
+/// unilaterally cancel the vault and reclaim any stuck allowance (7 days).
+pub const PAUSE_RECOVERY_TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// #225: upper bound on milestone escrow stages, keeping approval bounded.
+pub const MAX_MILESTONE_ESCROW_STAGES: u32 = 20;
+
 // Calculates (threshold, extend_to) in ledgers for vault persistent storage
 /// and contract instance storage based on interval_seconds.
 pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
@@ -74,6 +129,46 @@ pub fn calculate_ttl_params(interval_seconds: u64) -> (u32, u32) {
 // ----------------------------------------------------------------------------
 // DATA STRUCTURES
 // ----------------------------------------------------------------------------
+
+/// Typed authorization a subscriber signs so a relayer can create their vault
+/// without the subscriber paying network fees (#296). The subscriber signs
+/// [`delegated_vault_digest`] of this payload; any account may then submit it
+/// through `create_vault_delegated`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedVaultAuthorization {
+    /// Subscriber; must be an Ed25519 account (`G...`) so their key can sign.
+    pub user: Address,
+    pub merchant: Address,
+    /// Token the allowance is for. Signed so a relayer cannot swap it.
+    pub token: Address,
+    /// Amount per billing interval, in the token's base units.
+    pub amount: i128,
+    /// Billing interval in ledgers (~5s each).
+    pub interval_ledgers: u32,
+    /// Must equal `get_user_nonce(user)`; consumed on success.
+    pub nonce: u64,
+    /// Last ledger sequence at which the signature is valid.
+    pub expiry_ledger: u32,
+}
+
+/// Errors returned by `create_vault_delegated` (#296).
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum DelegatedAuthError {
+    /// The subscriber cannot have produced an Ed25519 signature (not an
+    /// Ed25519 account address). A signature that fails verification against
+    /// the subscriber's key is rejected by the host's Ed25519 check, which
+    /// aborts the invocation before this error could be returned.
+    InvalidSignature = 1,
+    /// `nonce` is not the subscriber's current nonce: replayed or stale.
+    InvalidNonce = 2,
+    /// The current ledger is past `expiry_ledger`.
+    SignatureExpired = 3,
+    /// `amount` or `interval_ledgers` is not positive, or the interval overflows.
+    InvalidAuthorization = 4,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +200,30 @@ pub struct VaultData {
     pub trial_end_timestamp: u64,
     /// Setup/onboarding fee charged on vault creation (#253)
     pub setup_fee: i128,
+    /// Ledger after which pulls are rejected. 0 means unbounded (#300).
+    pub expiration_ledger: u32,
+    /// Maximum lifetime disbursement. `UNLIMITED_LIFETIME_CAP` means unbounded (#300).
+    pub lifetime_cap_amount: i128,
+    /// Cumulative amount successfully pulled so far (#300).
+    pub total_pulled_amount: i128,
+}
+
+/// Exact v0.1.x vault layout. Used only to migrate vaults written before the
+/// #300 fields existed; new vaults always use `VaultData`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyVaultData {
+    pub token: Address,
+    pub amount_per_interval: i128,
+    pub interval_seconds: u64,
+    pub last_pull_timestamp: u64,
+    pub grace_period_seconds: u64,
+    pub payment_status: u32,
+    pub initial_timestamp: u64,
+    pub pull_sequence: u64,
+    pub is_paused: bool,
+    pub trial_end_timestamp: u64,
+    pub setup_fee: i128,
 }
 
 #[contracttype]
@@ -135,6 +254,8 @@ pub enum StorageKey {
 pub struct PaymentSplit {
     pub recipient: Address,
     pub amount: i128,
+    /// Token contract used for this recipient's payment (#301).
+    pub token: Address,
 }
 
 /// Per-subscriber outcome of a `batch_pull_funds` call (#92). `success` is false
@@ -205,6 +326,10 @@ pub enum DataKey {
     /// Id the next payroll escrow deposit will receive
     NextPayrollEscrowId,
     PayrollEscrow(u64),
+    /// #225: id the next milestone escrow will receive.
+    NextMilestoneEscrowId,
+    /// #225: milestone-based payroll escrow with dispute arbiter.
+    MilestoneEscrow(u64),
     /// Id the next Merkle payroll distribution will receive (#156)
     NextMerklePayrollId,
     MerklePayroll(u64),
@@ -485,6 +610,90 @@ pub enum FeatureKey {
     LoyaltyTiers(Address),
     /// Contract admin address (#255)
     Admin,
+    /// Global reward distribution root and token (#302)
+    RewardMerkleRoot,
+    RewardToken,
+    RewardClaim(Address),
+    /// Administrator authorized to rotate the reward root and fund claims. The
+    /// first `set_reward_root` call bootstraps it (deferring to the global admin
+    /// when one is configured); later rotations require the same address.
+    RewardAdmin,
+    /// Marks a vault stored with the #300 `VaultData` layout. Without it the
+    /// entry is decoded as `LegacyVaultData` and migrated on first read.
+    VaultLimitSchema(Address, Address),
+    /// #223: global circuit-breaker state, stored in instance storage.
+    PauseState,
+    /// #226: per-vault rolling-window rate limit configuration and state.
+    VaultRateLimit(Address, Address),
+    /// #224: global protocol treasury fee configuration.
+    ProtocolFee,
+    /// #223: escrow hold ids created for a vault, so a post-timelock recovery
+    /// can refund every still-pending hold to the subscriber.
+    VaultEscrowIds(Address, Address),
+}
+
+// ----------------------------------------------------------------------------
+// CIRCUIT BREAKER, RATE LIMITS, PROTOCOL FEES & MILESTONE ESCROW (#223-226)
+// ----------------------------------------------------------------------------
+
+/// #223: global circuit-breaker state. Kept in instance storage so pausing and
+/// resuming the whole protocol is a single cheap, atomic write.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    pub paused: bool,
+    /// Ledger timestamp at which the current pause began. Zero while unpaused.
+    pub paused_at: u64,
+}
+
+/// #226: rolling-window allowance for a fixed-interval vault. Ledger sequences
+/// (not timestamps) drive the window so capacity reset is deterministic even
+/// when ledger close times drift.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultRateLimit {
+    pub window_duration_ledgers: u32,
+    pub max_cumulative_amount: i128,
+    /// Ledger at which the current window began.
+    pub window_start_ledger: u32,
+    /// Amount settled in the current window.
+    pub window_spent: i128,
+}
+
+/// #224: optional protocol treasury fee. `fee_bps` is capped at
+/// [`MAX_PROTOCOL_FEE_BPS`] when configured.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeConfig {
+    pub fee_bps: u32,
+    pub treasury: Address,
+}
+
+/// #225: lifecycle of a milestone escrow.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MilestoneEscrowStatus {
+    Pending,
+    Approved,
+    Disputed,
+    Refunded,
+}
+
+/// #225: milestone-based payroll escrow with an independent arbiter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneEscrow {
+    pub id: u64,
+    pub employer: Address,
+    pub contractor: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub milestone_amounts: Vec<i128>,
+    /// Parallel to `milestone_amounts`; true once a milestone was paid out.
+    pub released: Vec<bool>,
+    pub released_amount: i128,
+    pub status: MilestoneEscrowStatus,
 }
 
 // ----------------------------------------------------------------------------
@@ -760,6 +969,16 @@ fn store_escrow(
         dispute_timeout_ledgers: policy.dispute_timeout_ledgers,
     };
     env.storage().persistent().set(&hold_key, &hold);
+    // Track holds per vault so a #223 post-timelock recovery can refund every
+    // still-pending hold to the subscriber.
+    let ids_key = FeatureKey::VaultEscrowIds(user.clone(), merchant.clone());
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&ids_key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(next);
+    env.storage().persistent().set(&ids_key, &ids);
     extend_key(env, &hold_key, policy.window_seconds);
     next
 }
@@ -778,12 +997,93 @@ fn vault_key(user: &Address, merchant: &Address) -> VaultKey {
     }
 }
 
+/// Marker distinguishing the extended #300 `VaultData` layout from v0.1.x
+/// entries that only contain the original fields.
+fn vault_schema_key(key: &VaultKey) -> FeatureKey {
+    FeatureKey::VaultLimitSchema(key.user.clone(), key.merchant.clone())
+}
+
 fn load_vault(env: &Env, key: &VaultKey) -> Option<VaultData> {
-    env.storage().persistent().get(key)
+    let storage = env.storage().persistent();
+    if storage.has(&vault_schema_key(key)) {
+        return storage.get(key);
+    }
+    // Backward-compatible migration: legacy vaults are unbounded and have
+    // pulled nothing since the cumulative counter did not exist yet.
+    storage
+        .get::<_, LegacyVaultData>(key)
+        .map(|legacy| VaultData {
+            token: legacy.token,
+            amount_per_interval: legacy.amount_per_interval,
+            interval_seconds: legacy.interval_seconds,
+            last_pull_timestamp: legacy.last_pull_timestamp,
+            grace_period_seconds: legacy.grace_period_seconds,
+            payment_status: legacy.payment_status,
+            initial_timestamp: legacy.initial_timestamp,
+            pull_sequence: legacy.pull_sequence,
+            is_paused: legacy.is_paused,
+            trial_end_timestamp: legacy.trial_end_timestamp,
+            setup_fee: legacy.setup_fee,
+            expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
+            lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
+            total_pulled_amount: 0,
+        })
 }
 
 fn save_vault(env: &Env, key: &VaultKey, vault: &VaultData) {
     env.storage().persistent().set(key, vault);
+    let schema_key = vault_schema_key(key);
+    env.storage().persistent().set(&schema_key, &true);
+    let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+    env.storage()
+        .persistent()
+        .extend_ttl(&schema_key, threshold, extend_to);
+}
+
+/// 0 ledger and -1 amount are the explicit unbounded sentinels. Any other
+/// past/current ledger or non-positive cap is invalid configuration.
+fn validate_vault_limits(
+    env: &Env,
+    expiration_ledger: u32,
+    lifetime_cap_amount: i128,
+    sequence: u32,
+) {
+    if expiration_ledger != UNLIMITED_EXPIRATION_LEDGER && expiration_ledger <= sequence {
+        panic_with_error!(env, OrbitContractError::InvalidVaultLimit);
+    }
+    if lifetime_cap_amount != UNLIMITED_LIFETIME_CAP && lifetime_cap_amount <= 0 {
+        panic_with_error!(env, OrbitContractError::InvalidVaultLimit);
+    }
+}
+
+/// Whether a pull must be rejected for the #300 guards. The terminal status is
+/// sticky even if the ledger clock is later rewound.
+fn vault_is_expired(env: &Env, vault: &VaultData) -> bool {
+    vault.payment_status == PAYMENT_EXPIRED
+        || (vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger)
+}
+
+/// The amount still available under the lifetime cap, or `None` if unbounded.
+fn remaining_vault_cap(vault: &VaultData) -> Option<i128> {
+    if vault.lifetime_cap_amount == UNLIMITED_LIFETIME_CAP {
+        return None;
+    }
+    Some(vault.lifetime_cap_amount - vault.total_pulled_amount)
+}
+
+fn mark_vault_expired(env: &Env, key: &VaultKey, vault: &VaultData) {
+    let mut expired = vault.clone();
+    expired.payment_status = PAYMENT_EXPIRED;
+    save_vault(env, key, &expired);
+    env.events().publish(
+        (
+            Symbol::new(env, "vault_expired"),
+            key.user.clone(),
+            key.merchant.clone(),
+        ),
+        (expired.total_pulled_amount, env.ledger().sequence()),
+    );
 }
 
 fn extend_feature_key(env: &Env, key: &FeatureKey, lifetime_seconds: u64) {
@@ -791,6 +1091,201 @@ fn extend_feature_key(env: &Env, key: &FeatureKey, lifetime_seconds: u64) {
     env.storage()
         .persistent()
         .extend_ttl(key, threshold, extend_to);
+}
+
+// ----------------------------------------------------------------------------
+// #223: EMERGENCY PAUSE HELPERS
+// ----------------------------------------------------------------------------
+
+fn load_pause_state(env: &Env) -> PauseState {
+    env.storage()
+        .instance()
+        .get(&FeatureKey::PauseState)
+        .unwrap_or(PauseState {
+            paused: false,
+            paused_at: 0,
+        })
+}
+
+fn save_pause_state(env: &Env, state: &PauseState) {
+    env.storage().instance().set(&FeatureKey::PauseState, state);
+    // The flag must outlive the recovery timelock so a paused protocol can
+    // always be unpaused (or recovered from) rather than silently reverting to
+    // the default "running" state when instance storage expires.
+    let (threshold, extend_to) = calculate_ttl_params(PAUSE_RECOVERY_TIMELOCK_SECONDS);
+    env.storage().instance().extend_ttl(threshold, extend_to);
+}
+
+fn assert_not_paused(env: &Env) {
+    if load_pause_state(env).paused {
+        panic_with_error!(env, OrbitContractError::EmergencyPaused);
+    }
+}
+
+/// Require the caller to be the configured protocol admin. The first caller
+/// bootstraps the admin slot; every later call must match the stored address.
+fn bootstrap_or_require_admin(env: &Env, caller: &Address) {
+    caller.require_auth();
+    let key = FeatureKey::Admin;
+    match env.storage().persistent().get::<_, Address>(&key) {
+        Some(admin) if admin == *caller => (),
+        Some(_) => panic_with_error!(env, OrbitContractError::UnauthorizedAdmin),
+        None => {
+            env.storage().persistent().set(&key, caller);
+            extend_feature_key(env, &key, PAUSE_RECOVERY_TIMELOCK_SECONDS);
+            env.events()
+                .publish((symbol_short!("admin_set"), caller.clone()), ());
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// #226: SLIDING-Window RATE LIMIT HELPERS
+// ----------------------------------------------------------------------------
+
+fn rate_limit_key(user: &Address, merchant: &Address) -> FeatureKey {
+    FeatureKey::VaultRateLimit(user.clone(), merchant.clone())
+}
+
+/// Charge `amount` against the vault's rolling window. When the window has
+/// elapsed, previously spent capacity decays to zero before the check, so a
+/// merchant can bill again without a new vault-creation transaction.
+fn consume_rate_limit(env: &Env, user: &Address, merchant: &Address, amount: i128) {
+    let key = rate_limit_key(user, merchant);
+    let Some(mut limit) = env.storage().persistent().get::<_, VaultRateLimit>(&key) else {
+        return;
+    };
+    let now = env.ledger().sequence();
+    let window_end = limit
+        .window_start_ledger
+        .saturating_add(limit.window_duration_ledgers);
+    // Ledger 0 is a perfectly valid window start, so only the sequence
+    // comparison (never a sentinel) decides when capacity decays.
+    if now >= window_end {
+        limit.window_start_ledger = now;
+        limit.window_spent = 0;
+    }
+    let proposed = limit
+        .window_spent
+        .checked_add(amount)
+        .expect("Rate-limit accumulation overflow");
+    if proposed > limit.max_cumulative_amount {
+        panic_with_error!(env, OrbitContractError::RateLimitExceeded);
+    }
+    limit.window_spent = proposed;
+    env.storage().persistent().set(&key, &limit);
+    extend_feature_key(
+        env,
+        &key,
+        u64::from(limit.window_duration_ledgers) * SECONDS_PER_LEDGER,
+    );
+    env.events().publish(
+        (
+            Symbol::new(env, "rate_window_spent"),
+            user.clone(),
+            merchant.clone(),
+        ),
+        (limit.window_spent, limit.max_cumulative_amount, now),
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #224: PROTOCOL TREASURY FEE HELPERS
+// ----------------------------------------------------------------------------
+
+fn load_protocol_fee(env: &Env) -> Option<ProtocolFeeConfig> {
+    env.storage().persistent().get(&FeatureKey::ProtocolFee)
+}
+
+/// Fee for one split, rounded down in the token's base units.
+fn protocol_fee_for(amount: i128, fee_bps: u32) -> i128 {
+    amount
+        .checked_mul(i128::from(fee_bps))
+        .expect("Protocol fee multiplication overflow")
+        / BPS_DENOMINATOR
+}
+
+/// Deduct the configured fee from every split so total allowance never has to
+/// exceed the original batch amount. Returns the net splits, per-token fee
+/// totals, and the applied configuration (for event emission).
+fn apply_protocol_fees(
+    env: &Env,
+    splits: Vec<PaymentSplit>,
+) -> (
+    Vec<PaymentSplit>,
+    Vec<(Address, i128)>,
+    Option<ProtocolFeeConfig>,
+) {
+    let Some(config) = load_protocol_fee(env) else {
+        return (splits, Vec::new(env), None);
+    };
+    // Zero-bps / unconfigured fee is a straight pass-through with no overhead.
+    if config.fee_bps == 0 {
+        return (splits, Vec::new(env), None);
+    }
+    let mut net_splits = Vec::new(env);
+    let mut fee_splits = Vec::new(env);
+    for split in splits.iter() {
+        let fee = protocol_fee_for(split.amount, config.fee_bps);
+        net_splits.push_back(PaymentSplit {
+            recipient: split.recipient.clone(),
+            amount: split.amount.checked_sub(fee).expect("Fee exceeds split"),
+            token: split.token.clone(),
+        });
+        fee_splits.push_back(PaymentSplit {
+            recipient: config.treasury.clone(),
+            amount: fee,
+            token: split.token.clone(),
+        });
+    }
+    let fee_totals = payroll_totals(env, &fee_splits);
+    (net_splits, fee_totals, Some(config))
+}
+
+/// Transfer accumulated fees to the treasury and publish the transparency
+/// event required by #224.
+fn settle_protocol_fees(
+    env: &Env,
+    sender: &Address,
+    fee_totals: &Vec<(Address, i128)>,
+    config: &ProtocolFeeConfig,
+) {
+    for (token, fee) in fee_totals.iter() {
+        if fee <= 0 {
+            continue;
+        }
+        token::Client::new(env, &token).transfer_from(
+            &env.current_contract_address(),
+            sender,
+            &config.treasury,
+            &fee,
+        );
+        env.events()
+            .publish((symbol_short!("fee"), config.treasury.clone()), fee);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// #225: MILESTONE ESCROW HELPERS
+// ----------------------------------------------------------------------------
+
+fn load_milestone_escrow(env: &Env, escrow_id: u64) -> MilestoneEscrow {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MilestoneEscrow(escrow_id))
+        .expect("Milestone escrow does not exist")
+}
+
+fn save_milestone_escrow(env: &Env, escrow: &MilestoneEscrow) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MilestoneEscrow(escrow.id), escrow);
+    // Milestone payouts can be spread over a long delivery schedule.
+    env.storage().persistent().extend_ttl(
+        &DataKey::MilestoneEscrow(escrow.id),
+        TTL_THRESHOLD_LEDGERS,
+        MIN_TTL_LEDGERS,
+    );
 }
 
 fn shareholder_weight(state: &RevenuePoolState, shareholder: &Address) -> u32 {
@@ -822,9 +1317,10 @@ fn remove_vault(env: &Env, user: &Address, merchant: &Address) {
     assert!(has_fixed || has_metered, "Vault does not exist");
 
     if has_fixed {
-        let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
+        let vault = load_vault(env, &key).expect("Vault missing");
         deactivate_badge(env, user, merchant, vault.interval_seconds);
         env.storage().persistent().remove(&key);
+        env.storage().persistent().remove(&vault_schema_key(&key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -876,6 +1372,37 @@ fn write_vault(
     trial_end_timestamp: u64,
     setup_fee: i128,
 ) {
+    write_vault_with_limits(
+        env,
+        user,
+        merchant,
+        token,
+        amount_per_interval,
+        interval_seconds,
+        grace_period_seconds,
+        trial_end_timestamp,
+        setup_fee,
+        UNLIMITED_EXPIRATION_LEDGER,
+        UNLIMITED_LIFETIME_CAP,
+    );
+}
+
+/// Same as `write_vault`, but with the optional #300 expiration and lifetime
+/// cap. Existing creation entrypoints deliberately keep unlimited semantics.
+#[allow(clippy::too_many_arguments)]
+fn write_vault_with_limits(
+    env: &Env,
+    user: &Address,
+    merchant: &Address,
+    token: &Address,
+    amount_per_interval: i128,
+    interval_seconds: u64,
+    grace_period_seconds: u64,
+    trial_end_timestamp: u64,
+    setup_fee: i128,
+    expiration_ledger: u32,
+    lifetime_cap_amount: i128,
+) {
     assert!(
         amount_per_interval > 0,
         "amount_per_interval must be positive"
@@ -884,11 +1411,14 @@ fn write_vault(
         interval_seconds > 0,
         "interval_seconds must be greater than zero"
     );
+    validate_vault_limits(
+        env,
+        expiration_ledger,
+        lifetime_cap_amount,
+        env.ledger().sequence(),
+    );
 
-    let key = VaultKey {
-        user: user.clone(),
-        merchant: merchant.clone(),
-    };
+    let key = vault_key(user, merchant);
 
     let vault_data = VaultData {
         token: token.clone(),
@@ -902,9 +1432,12 @@ fn write_vault(
         is_paused: false,
         trial_end_timestamp,
         setup_fee,
+        expiration_ledger,
+        lifetime_cap_amount,
+        total_pulled_amount: 0,
     };
 
-    env.storage().persistent().set(&key, &vault_data);
+    save_vault(env, &key, &vault_data);
 
     // Collect setup fee if specified (#253)
     if setup_fee > 0 {
@@ -1364,6 +1897,81 @@ impl OrbitContract {
         );
     }
 
+    /// Create a vault with an optional ledger expiration and lifetime pull cap
+    /// (#300). `expiration_ledger = 0` and `lifetime_cap_amount = -1` are the
+    /// explicit unbounded sentinels; all other non-positive values are rejected.
+    pub fn create_vault_with_limits(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        expiration_ledger: u32,
+        lifetime_cap_amount: i128,
+    ) {
+        user.require_auth();
+        validate_vault_limits(
+            &env,
+            expiration_ledger,
+            lifetime_cap_amount,
+            env.ledger().sequence(),
+        );
+        write_vault_with_limits(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+            0,
+            expiration_ledger,
+            lifetime_cap_amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "vault_limits_configured"), user, merchant),
+            (expiration_ledger, lifetime_cap_amount),
+        );
+    }
+
+    /// Update the optional limits of an existing vault. Subscriber-authorized,
+    /// matching the other vault configuration entrypoints. Expired vaults are
+    /// terminal and cannot be revived by raising the cap.
+    pub fn configure_vault_limits(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        expiration_ledger: u32,
+        lifetime_cap_amount: i128,
+    ) {
+        user.require_auth();
+        validate_vault_limits(
+            &env,
+            expiration_ledger,
+            lifetime_cap_amount,
+            env.ledger().sequence(),
+        );
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        if vault.payment_status == PAYMENT_EXPIRED {
+            panic_with_error!(&env, OrbitContractError::VaultExpired);
+        }
+        if lifetime_cap_amount != UNLIMITED_LIFETIME_CAP
+            && vault.total_pulled_amount > lifetime_cap_amount
+        {
+            panic_with_error!(&env, OrbitContractError::InvalidVaultLimit);
+        }
+        vault.expiration_ledger = expiration_ledger;
+        vault.lifetime_cap_amount = lifetime_cap_amount;
+        save_vault(&env, &key, &vault);
+        env.events().publish(
+            (Symbol::new(&env, "vault_limits_configured"), user, merchant),
+            (expiration_ledger, lifetime_cap_amount),
+        );
+    }
+
     /// Create a vault with an upfront setup fee collected on initialization (#253)
     pub fn create_vault_with_setup_fee(
         env: Env,
@@ -1425,8 +2033,10 @@ impl OrbitContract {
         );
     }
 
-    /// Create a vault with both trial period and setup fee (#253)
-    pub fn create_vault_with_trial_and_setup_fee(
+    /// Create a vault with both trial period and setup fee (#253).
+    /// Named to fit Soroban's 32-character limit on contract function names;
+    /// the original `create_vault_with_trial_and_setup_fee` (37) failed to build.
+    pub fn create_vault_trial_setup_fee(
         env: Env,
         user: Address,
         merchant: Address,
@@ -1647,11 +2257,17 @@ impl OrbitContract {
             is_paused: true,
             trial_end_timestamp: 0,
             setup_fee: 0,
+            expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
+            lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
+            total_pulled_amount: 0,
         };
 
         // Remove the old contract-level connection before creating the new one.
         deactivate_badge(&env, &user, &merchant, old_vault.interval_seconds);
         env.storage().persistent().remove(&old_key);
+        env.storage()
+            .persistent()
+            .remove(&vault_schema_key(&old_key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -1930,7 +2546,10 @@ impl OrbitContract {
         user.require_auth();
         merchant.require_auth();
         assert!(escrow_window_seconds > 0, "Escrow window must be positive");
-        assert!(dispute_timeout_ledgers > 0, "Dispute timeout must be positive");
+        assert!(
+            dispute_timeout_ledgers > 0,
+            "Dispute timeout must be positive"
+        );
         let vault: VaultData = env
             .storage()
             .persistent()
@@ -1980,8 +2599,14 @@ impl OrbitContract {
     }
 
     /// The escrow's designated arbitrator is the only entity authorized to
-    /// apportion funds. Percentages outside 0–100 are rejected.
-    pub fn resolve_dispute(env: Env, arbitrator: Address, pull_id: u64, refund_percentage: u32) {
+    /// apportion funds. Percentages outside 0–100 are rejected. Renamed from
+    /// `resolve_dispute` so the #225 milestone resolver can own that name.
+    pub fn resolve_pull_dispute(
+        env: Env,
+        arbitrator: Address,
+        pull_id: u64,
+        refund_percentage: u32,
+    ) {
         arbitrator.require_auth();
         assert!(refund_percentage <= 100, "Invalid refund percentage");
         let key = SubscriptionKey::Escrow(pull_id);
@@ -1993,7 +2618,9 @@ impl OrbitContract {
         assert!(hold.disputed, "Escrow is not disputed");
         assert!(hold.arbitrator == arbitrator, "Unauthorized arbitrator");
         assert!(
-            env.ledger().sequence().saturating_sub(hold.dispute_started_ledger)
+            env.ledger()
+                .sequence()
+                .saturating_sub(hold.dispute_started_ledger)
                 < hold.dispute_timeout_ledgers,
             "Dispute timeout elapsed"
         );
@@ -2138,7 +2765,7 @@ impl OrbitContract {
             .checked_add(vault.interval_seconds)
             .expect("Due date overflow");
 
-        if vault.payment_status == PAYMENT_DEFAULTED {
+        if vault.payment_status == PAYMENT_DEFAULTED || vault.payment_status == PAYMENT_EXPIRED {
             return;
         }
         if current_time > due_date {
@@ -2253,8 +2880,7 @@ impl OrbitContract {
         );
 
         // Extend storage TTL for the new interval
-        let (threshold, extend_to) =
-            calculate_ttl_params(vault.interval_seconds);
+        let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, extend_to);
@@ -2304,6 +2930,8 @@ impl OrbitContract {
     /// The merchant (or the Orbit backend) calls this to pull the funds.
     pub fn pull_funds(env: Env, user: Address, merchant: Address) {
         merchant.require_auth();
+        // #223: a global emergency pause halts every pull transaction.
+        assert_not_paused(&env);
 
         let key = vault_key(&user, &merchant);
         let mut vault = load_vault(&env, &key).expect("Vault does not exist");
@@ -2336,6 +2964,11 @@ impl OrbitContract {
             vault.payment_status != PAYMENT_DEFAULTED,
             "Vault is defaulted"
         );
+        // #300: an expired vault (ledger sequence or terminal status) can never
+        // pull again, even if a later retry arrives within the billing interval.
+        if vault_is_expired(&env, &vault) {
+            panic_with_error!(&env, OrbitContractError::VaultExpired);
+        }
 
         if vault.last_pull_timestamp != 0 {
             assert!(
@@ -2358,17 +2991,32 @@ impl OrbitContract {
         // best matching tier; the discounted amount is what actually settles.
         let base_amount = vault.amount_per_interval;
         let discount_bps = loyalty_discount_bps(&env, &user, &merchant);
-        if discount_bps > 0 {
+        let pull_amount = if discount_bps > 0 {
             let settled = base_amount - base_amount * i128::from(discount_bps) / BPS_DENOMINATOR;
             assert!(settled > 0, "Loyalty discount would zero out the payment");
-            vault.amount_per_interval = settled;
+            settled
+        } else {
+            base_amount
+        };
+        // Check the actual settled amount, so a discounted pull cannot bypass
+        // the cap, and reject the whole request rather than partially paying.
+        if let Some(remaining) = remaining_vault_cap(&vault) {
+            if pull_amount > remaining {
+                panic_with_error!(&env, OrbitContractError::LifetimeCapExceeded);
+            }
+        }
+        // #226: charge the settled amount against the vault's rolling window
+        // before any token moves. Expired windows reset capacity here.
+        consume_rate_limit(&env, &user, &merchant, pull_amount);
+        if discount_bps > 0 {
+            vault.amount_per_interval = pull_amount;
             env.events().publish(
                 (
                     Symbol::new(&env, "loyalty_discount_applied"),
                     user.clone(),
                     merchant.clone(),
                 ),
-                (discount_bps, settled),
+                (discount_bps, pull_amount),
             );
         }
 
@@ -2411,11 +3059,22 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        // Cumulative accounting uses the amount actually transferred (#300).
+        vault.total_pulled_amount = vault
+            .total_pulled_amount
+            .checked_add(pull_amount)
+            .expect("Lifetime pull total overflow");
+        let cap_reached = remaining_vault_cap(&vault) == Some(0);
+        let expiration_reached = vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger;
         // Persist the full recurring charge; only this settlement was discounted.
         vault.amount_per_interval = base_amount;
         let amount_per_interval = vault.amount_per_interval;
         let interval_seconds = vault.interval_seconds;
         save_vault(&env, &key, &vault);
+        if cap_reached || expiration_reached {
+            mark_vault_expired(&env, &key, &vault);
+        }
 
         // Emit contract event
         env.events().publish(
@@ -2504,7 +3163,7 @@ impl OrbitContract {
         if vault.is_paused {
             return skipped(0);
         }
-        if vault.payment_status == PAYMENT_DEFAULTED {
+        if vault.payment_status == PAYMENT_DEFAULTED || vault_is_expired(env, &vault) {
             return skipped(0);
         }
 
@@ -2520,6 +3179,14 @@ impl OrbitContract {
             current_time.saturating_sub(vault.initial_timestamp) / vault.interval_seconds;
         if vault.pull_sequence != PULL_SEQUENCE_UNSET && cycle_index <= vault.pull_sequence {
             return skipped(0);
+        }
+
+        // The lifetime cap is a hard per-subscriber guard (#300). Skipping keeps
+        // the fault-tolerant batch semantics while preventing any over-pull.
+        if let Some(remaining) = remaining_vault_cap(&vault) {
+            if vault.amount_per_interval > remaining {
+                return skipped(0);
+            }
         }
 
         // Skip a subscriber whose balance cannot cover this interval instead of
@@ -2540,7 +3207,17 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        vault.total_pulled_amount = vault
+            .total_pulled_amount
+            .checked_add(amount)
+            .expect("Lifetime pull total overflow");
+        let cap_reached = remaining_vault_cap(&vault) == Some(0);
+        let expiration_reached = vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
+            && env.ledger().sequence() >= vault.expiration_ledger;
         save_vault(env, &key, &vault);
+        if cap_reached || expiration_reached {
+            mark_vault_expired(env, &key, &vault);
+        }
 
         let tier = env
             .storage()
@@ -2909,15 +3586,43 @@ impl OrbitContract {
     pub fn batch_disburse(env: Env, sender: Address, token: Address, splits: Vec<PaymentSplit>) {
         // The sender (e.g., the Agency Owner) MUST sign this transaction to approve the payroll.
         sender.require_auth();
+        // #223: a global emergency pause also halts batch payroll disbursements.
+        assert_not_paused(&env);
 
+        // The sender funds both the recipient payouts and the treasury fee,
+        // so allowance must cover the original (gross) batch before we split.
+        verify_payroll_allowances(&env, &sender, &splits);
+        // #224: net out the configured treasury fee from each split. Total
+        // allowance required stays equal to the original batch amount.
+        let (splits, fee_totals, fee_config) = apply_protocol_fees(&env, splits);
         let total_amount = validate_splits(&splits);
         let recipient_count = splits.len();
-        disburse(&env, &sender, &token, splits);
+        let totals = payroll_totals(&env, &splits);
+        disburse(&env, &sender, splits);
+        if let Some(config) = fee_config {
+            settle_protocol_fees(&env, &sender, &fee_totals, &config);
+        }
 
-        // Emit contract event
+        // Legacy aggregate event; `token` is kept for existing consumers while
+        // the summary event below reports per-asset totals (#301).
         env.events().publish(
-            (Symbol::new(&env, "batch_disbursed"), sender),
+            (Symbol::new(&env, "batch_disbursed"), sender.clone()),
             (token, recipient_count, total_amount),
+        );
+        let mut used_tokens = Vec::new(&env);
+        let mut volume_per_token = Vec::new(&env);
+        for (asset, volume) in totals.iter() {
+            used_tokens.push_back(asset);
+            volume_per_token.push_back(volume);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "payroll_summary"), sender),
+            (
+                used_tokens,
+                volume_per_token,
+                recipient_count,
+                env.ledger().sequence(),
+            ),
         );
     }
 
@@ -3029,20 +3734,31 @@ impl OrbitContract {
 
         let total_amount = validate_splits(&proposal.splits);
         let recipient_count = proposal.splits.len();
-        disburse(
-            &env,
-            &proposal.sender,
-            &proposal.token,
-            proposal.splits.clone(),
-        );
+        let totals = payroll_totals(&env, &proposal.splits);
+        verify_payroll_allowances(&env, &proposal.sender, &proposal.splits);
+        disburse(&env, &proposal.sender, proposal.splits.clone());
 
         env.events().publish(
             (
                 Symbol::new(&env, "payroll_executed"),
-                proposal.sender,
+                proposal.sender.clone(),
                 proposal_id,
             ),
             (proposal.token, recipient_count, total_amount),
+        );
+        let mut used_tokens = Vec::new(&env);
+        let mut volume_per_token = Vec::new(&env);
+        for (asset, volume) in totals.iter() {
+            used_tokens.push_back(asset);
+            volume_per_token.push_back(volume);
+        }
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_summary"),
+                proposal.sender,
+                proposal_id,
+            ),
+            (used_tokens, volume_per_token, recipient_count),
         );
     }
 
@@ -3607,6 +4323,42 @@ impl OrbitContract {
         unclaimed
     }
 
+    /// Cancels a payroll batch before it is fully paid out (#287). Only the
+    /// creator can cancel. The unclaimed balance is refunded to the creator in
+    /// one transfer and the batch is marked `reclaimed`, which blocks any later
+    /// claim, reclaim or cancel. Amounts recipients already claimed are kept.
+    /// Returns the refunded amount.
+    pub fn cancel_batch_payroll(env: Env, sender: Address, batch_id: u64) -> i128 {
+        sender.require_auth();
+
+        let mut batch = load_payroll_escrow(&env, batch_id);
+        assert!(batch.sender == sender, "Not the batch creator");
+        assert!(!batch.reclaimed, "Batch already cancelled or reclaimed");
+
+        let unclaimed = batch.total_deposited - batch.claimed_amount;
+        assert!(unclaimed > 0, "No unclaimed balance to refund");
+
+        // Mark before transferring so the batch can only be cancelled once.
+        batch.reclaimed = true;
+        save_payroll_escrow(&env, &batch);
+
+        token::Client::new(&env, &batch.token).transfer(
+            &env.current_contract_address(),
+            &sender,
+            &unclaimed,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "payroll_batch_cancelled"),
+                sender,
+                batch_id,
+            ),
+            (batch.token, unclaimed),
+        );
+        unclaimed
+    }
+
     /// Read a payroll escrow record. Requires no authorization.
     pub fn get_payroll_escrow(env: Env, payroll_id: u64) -> Option<PayrollEscrow> {
         env.storage()
@@ -3790,6 +4542,141 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .has(&DataKey::MerkleClaimed(claim_id, leaf))
+    }
+
+    // --------------------------------------------------------------------
+    // ADMIN-CONFIGURED REWARD MERKLE ROOT (#302)
+    // --------------------------------------------------------------------
+
+    /// Stores the global reward Merkle root and the token used to pay claims.
+    /// Rotations require the reward administrator established by the first
+    /// call (the protocol admin when one is configured). The administrator must
+    /// also approve an allowance to this contract for claim payouts.
+    pub fn set_reward_root(env: Env, admin: Address, token: Address, root: BytesN<32>) {
+        admin.require_auth();
+        if root.to_array() == [0u8; 32] {
+            panic_with_error!(&env, OrbitContractError::InvalidMerkleRoot);
+        }
+        let reward_admin_key = FeatureKey::RewardAdmin;
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&reward_admin_key)
+        {
+            Some(current) if current == admin => (),
+            Some(_) => panic_with_error!(&env, OrbitContractError::UnauthorizedRootUpdate),
+            None => {
+                // One-time bootstrap: use the protocol admin when available,
+                // otherwise the first caller becomes the reward administrator.
+                if let Some(global_admin) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&FeatureKey::Admin)
+                {
+                    if global_admin != admin {
+                        panic_with_error!(&env, OrbitContractError::UnauthorizedRootUpdate);
+                    }
+                }
+                env.storage().persistent().set(&reward_admin_key, &admin);
+                extend_feature_key(
+                    &env,
+                    &reward_admin_key,
+                    MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+                );
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&FeatureKey::RewardMerkleRoot, &root);
+        env.storage()
+            .persistent()
+            .set(&FeatureKey::RewardToken, &token);
+        extend_feature_key(
+            &env,
+            &FeatureKey::RewardMerkleRoot,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        extend_feature_key(
+            &env,
+            &FeatureKey::RewardToken,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        env.events()
+            .publish((Symbol::new(&env, "reward_root_set"), admin), (token, root));
+    }
+
+    /// Current reward root, if one has been configured.
+    pub fn get_reward_root(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::RewardMerkleRoot)
+    }
+
+    /// Administrator authorized to rotate the reward root and fund claims.
+    pub fn get_reward_admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&FeatureKey::RewardAdmin)
+    }
+
+    /// Whether `claimant` has already claimed against the reward root.
+    pub fn is_reward_claimed(env: Env, claimant: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&FeatureKey::RewardClaim(claimant))
+    }
+
+    /// Claims a reward if `(claimant, amount)` is a leaf of the configured
+    /// Merkle root. Leaf encoding is canonical (`reward_leaf`) and sibling
+    /// ordering is handled by `merkle_hash_pair`. The claimant signs, and each
+    /// address may claim at most once.
+    pub fn claim_reward(env: Env, claimant: Address, amount: i128, proof: Vec<BytesN<32>>) {
+        claimant.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, OrbitContractError::InvalidRewardAmount);
+        }
+        let root: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&FeatureKey::RewardMerkleRoot)
+        {
+            Some(root) => root,
+            None => panic_with_error!(&env, OrbitContractError::MissingMerkleRoot),
+        };
+        let leaf = reward_leaf(&env, &claimant, amount);
+        if !verify_merkle_proof(&env, &proof, &root, &leaf) {
+            panic_with_error!(&env, OrbitContractError::InvalidMerkleProof);
+        }
+        let claim_key = FeatureKey::RewardClaim(claimant.clone());
+        if env.storage().persistent().has(&claim_key) {
+            panic_with_error!(&env, OrbitContractError::AlreadyClaimed);
+        }
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&FeatureKey::RewardToken)
+            .expect("Reward token is not configured");
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&FeatureKey::RewardAdmin)
+            .expect("No reward administrator configured");
+
+        // Mark before the external transfer; a failed transfer reverts both.
+        env.storage().persistent().set(&claim_key, &true);
+        extend_feature_key(
+            &env,
+            &claim_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
+        token::Client::new(&env, &token).transfer_from(
+            &env.current_contract_address(),
+            &admin,
+            &claimant,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "reward_claimed"), claimant),
+            (token, amount),
+        );
     }
 
     // --------------------------------------------------------------------
@@ -4316,6 +5203,7 @@ impl OrbitContract {
             interval_seconds,
             DEFAULT_GRACE_PERIOD_SECONDS,
             0,
+            0,
         );
         env.events().publish(
             (Symbol::new(&env, "vault_created_delegated"), user, merchant),
@@ -4339,6 +5227,71 @@ impl OrbitContract {
         remove_vault(&env, &user, &merchant);
     }
 
+    /// Create a vault from a subscriber-signed [`DelegatedVaultAuthorization`]
+    /// (#296). Anyone, typically a relayer or fee-bump submitter, may call it,
+    /// so a subscriber holding only USDC can onboard without XLM for fees.
+    ///
+    /// Checks, cheapest first: expiry, nonce, payload sanity, then a single
+    /// Ed25519 verification over [`delegated_vault_digest`]. On success the
+    /// subscriber's nonce is consumed, so the same signature can never be
+    /// replayed. The nonce is shared with `create_vault_with_signature`, so
+    /// the two signature schemes cannot be replayed into each other either.
+    pub fn create_vault_delegated(
+        env: Env,
+        authorization: DelegatedVaultAuthorization,
+        signature: BytesN<64>,
+    ) -> Result<(), DelegatedAuthError> {
+        if env.ledger().sequence() > authorization.expiry_ledger {
+            return Err(DelegatedAuthError::SignatureExpired);
+        }
+        let current_nonce = load_user_nonce(&env, &authorization.user);
+        if authorization.nonce != current_nonce {
+            return Err(DelegatedAuthError::InvalidNonce);
+        }
+        if authorization.amount <= 0 || authorization.interval_ledgers == 0 {
+            return Err(DelegatedAuthError::InvalidAuthorization);
+        }
+        let interval_seconds = u64::from(authorization.interval_ledgers)
+            .checked_mul(SECONDS_PER_LEDGER)
+            .ok_or(DelegatedAuthError::InvalidAuthorization)?;
+        let pubkey = ed25519_account_key(&env, &authorization.user)
+            .ok_or(DelegatedAuthError::InvalidSignature)?;
+
+        let digest = delegated_vault_digest(&env, &authorization);
+        env.crypto().ed25519_verify(
+            &pubkey,
+            &Bytes::from_array(&env, &digest.to_array()),
+            &signature,
+        );
+
+        bump_user_nonce(&env, &authorization.user, current_nonce);
+        write_vault(
+            &env,
+            &authorization.user,
+            &authorization.merchant,
+            &authorization.token,
+            authorization.amount,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+            0,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_delegated"),
+                authorization.user,
+                authorization.merchant,
+            ),
+            (
+                authorization.token,
+                authorization.amount,
+                authorization.interval_ledgers,
+                authorization.nonce,
+            ),
+        );
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // MULTI-SIG GOVERNANCE & TIMELOCK (#255)
     // -----------------------------------------------------------------------
@@ -4360,7 +5313,11 @@ impl OrbitContract {
 
         let proposed_key = DataKey::ProposedAdmin;
         env.storage().persistent().set(&proposed_key, &new_admin);
-        extend_feature_key(&env, &admin_key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        extend_feature_key(
+            &env,
+            &admin_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "admin_proposed"), current_admin),
@@ -4378,10 +5335,7 @@ impl OrbitContract {
             .persistent()
             .get(&proposed_key)
             .expect("No admin proposal pending");
-        assert!(
-            proposed == new_admin,
-            "You are not the proposed admin"
-        );
+        assert!(proposed == new_admin, "You are not the proposed admin");
 
         let admin_key = FeatureKey::Admin;
         let old_admin: Address = env
@@ -4392,7 +5346,11 @@ impl OrbitContract {
 
         env.storage().persistent().set(&admin_key, &new_admin);
         env.storage().persistent().remove(&proposed_key);
-        extend_feature_key(&env, &admin_key, MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER);
+        extend_feature_key(
+            &env,
+            &admin_key,
+            MIN_TTL_LEDGERS as u64 * SECONDS_PER_LEDGER,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"), old_admin),
@@ -4407,12 +5365,7 @@ impl OrbitContract {
 
     /// Queue a protocol parameter update with a minimum timelock delay (~24 hours).
     /// The parameter must be queued before execution.
-    pub fn queue_param_update(
-        env: Env,
-        admin: Address,
-        param_name: Symbol,
-        new_value: Bytes,
-    ) {
+    pub fn queue_param_update(env: Env, admin: Address, param_name: Symbol, new_value: Bytes) {
         admin.require_auth();
 
         let admin_key = FeatureKey::Admin;
@@ -4421,7 +5374,10 @@ impl OrbitContract {
             .persistent()
             .get(&admin_key)
             .expect("No admin configured");
-        assert!(stored_admin == admin, "Only the admin can queue parameter updates");
+        assert!(
+            stored_admin == admin,
+            "Only the admin can queue parameter updates"
+        );
 
         let now = env.ledger().timestamp();
         let timelock_duration: u64 = 17280 * 5; // ~24 hours in seconds (17,280 ledgers)
@@ -4454,7 +5410,10 @@ impl OrbitContract {
             .persistent()
             .get(&admin_key)
             .expect("No admin configured");
-        assert!(stored_admin == admin, "Only the admin can execute parameter updates");
+        assert!(
+            stored_admin == admin,
+            "Only the admin can execute parameter updates"
+        );
 
         let queue_key = DataKey::TimelockQueue(param_name.clone());
         let entry: TimelockEntry = env
@@ -4464,10 +5423,7 @@ impl OrbitContract {
             .expect("No queued update for this parameter");
 
         let now = env.ledger().timestamp();
-        assert!(
-            now >= entry.execute_after,
-            "Timelock has not elapsed yet"
-        );
+        assert!(now >= entry.execute_after, "Timelock has not elapsed yet");
 
         env.storage().persistent().remove(&queue_key);
 
@@ -4503,6 +5459,395 @@ impl OrbitContract {
                 (threshold, extend_to),
             );
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // #223: EMERGENCY PAUSE AND TIMELOCKED CIRCUIT BREAKER
+    // ------------------------------------------------------------------------
+
+    /// Bootstrap the protocol admin (first caller) or assert the caller is the
+    /// already configured admin. The first call establishes the admin key that
+    /// `propose_admin`/`claim_admin` later rotate.
+    pub fn set_admin(env: Env, caller: Address) {
+        bootstrap_or_require_admin(&env, &caller);
+    }
+
+    /// Halt every fund-moving entrypoint. Guarded by the protocol admin.
+    pub fn pause(env: Env, caller: Address) {
+        bootstrap_or_require_admin(&env, &caller);
+        let mut state = load_pause_state(&env);
+        if !state.paused {
+            state.paused = true;
+            state.paused_at = env.ledger().timestamp();
+            save_pause_state(&env, &state);
+            env.events()
+                .publish((symbol_short!("paused"), caller), state.paused_at);
+        }
+    }
+
+    /// Resume normal operation. Guarded by the protocol admin.
+    pub fn unpause(env: Env, caller: Address) {
+        bootstrap_or_require_admin(&env, &caller);
+        let mut state = load_pause_state(&env);
+        assert!(state.paused, "Protocol is not paused");
+        state.paused = false;
+        state.paused_at = 0;
+        save_pause_state(&env, &state);
+        env.events().publish(
+            (symbol_short!("unpaused"), caller),
+            env.ledger().timestamp(),
+        );
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        load_pause_state(&env).paused
+    }
+
+    pub fn get_pause_state(env: Env) -> PauseState {
+        load_pause_state(&env)
+    }
+
+    /// Escape hatch: once the pause has lasted longer than the safety window,
+    /// a vault owner may cancel the vault and reclaim every pending escrow hold
+    /// without waiting for the admin or the merchant.
+    pub fn reclaim_paused_vault(env: Env, user: Address, merchant: Address) {
+        user.require_auth();
+        let state = load_pause_state(&env);
+        assert!(state.paused, "Protocol is not paused");
+        let now = env.ledger().timestamp();
+        assert!(
+            state.paused_at > 0
+                && now
+                    >= state
+                        .paused_at
+                        .saturating_add(PAUSE_RECOVERY_TIMELOCK_SECONDS),
+            "Pause timelock has not elapsed"
+        );
+
+        let ids_key = FeatureKey::VaultEscrowIds(user.clone(), merchant.clone());
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ids_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for id in ids.iter() {
+            let hold_key = SubscriptionKey::Escrow(id);
+            if let Some(hold) = env.storage().persistent().get::<_, EscrowHold>(&hold_key) {
+                if hold.user == user
+                    && hold.merchant == merchant
+                    && !hold.disputed
+                    && hold.amount > 0
+                {
+                    token::Client::new(&env, &hold.token).transfer(
+                        &env.current_contract_address(),
+                        &user,
+                        &hold.amount,
+                    );
+                    env.events().publish(
+                        (Symbol::new(&env, "pause_reclaim"), user.clone(), id),
+                        hold.amount,
+                    );
+                }
+                env.storage().persistent().remove(&hold_key);
+            }
+        }
+        env.storage().persistent().remove(&ids_key);
+        remove_vault(&env, &user, &merchant);
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_reclaimed_after_pause"),
+                user,
+                merchant,
+            ),
+            now,
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // #224: PROTOCOL TREASURY FEE SPLIT
+    // ------------------------------------------------------------------------
+
+    /// Configure (or clear with `fee_bps = 0`) the protocol treasury fee.
+    /// Basis points are capped at 10% to protect payers.
+    pub fn set_protocol_fee(env: Env, caller: Address, fee_bps: u32, treasury: Address) {
+        bootstrap_or_require_admin(&env, &caller);
+        assert!(
+            fee_bps <= MAX_PROTOCOL_FEE_BPS,
+            "fee_bps must not exceed 1000"
+        );
+        let config = ProtocolFeeConfig {
+            fee_bps,
+            treasury: treasury.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&FeatureKey::ProtocolFee, &config);
+        extend_feature_key(&env, &FeatureKey::ProtocolFee, RECOVERY_TIMELOCK_SECONDS);
+        env.events().publish(
+            (Symbol::new(&env, "protocol_fee_set"), caller),
+            (fee_bps, treasury),
+        );
+    }
+
+    pub fn get_protocol_fee(env: Env) -> Option<ProtocolFeeConfig> {
+        load_protocol_fee(&env)
+    }
+
+    // ------------------------------------------------------------------------
+    // #225: MILESTONE ESCROW WITH DISPUTE ARBITER
+    // ------------------------------------------------------------------------
+
+    /// Fund a milestone-based escrow. The employer deposits `total_amount`
+    /// up front; individual milestones are released only on approval.
+    pub fn create_milestone_escrow(
+        env: Env,
+        employer: Address,
+        contractor: Address,
+        arbiter: Address,
+        token: Address,
+        total_amount: i128,
+        milestone_amounts: Vec<i128>,
+    ) -> u64 {
+        employer.require_auth();
+        assert!(total_amount > 0, "total_amount must be positive");
+        assert!(
+            !milestone_amounts.is_empty(),
+            "milestone_amounts must not be empty"
+        );
+        assert!(
+            milestone_amounts.len() <= MAX_MILESTONE_ESCROW_STAGES,
+            "too many milestones"
+        );
+        let mut milestone_total: i128 = 0;
+        for amount in milestone_amounts.iter() {
+            assert!(amount > 0, "milestone amount must be positive");
+            milestone_total = milestone_total
+                .checked_add(amount)
+                .expect("Milestone total overflow");
+        }
+        if milestone_total > total_amount {
+            panic_with_error!(&env, OrbitContractError::InvalidMilestoneEscrow);
+        }
+
+        let key = DataKey::NextMilestoneEscrowId;
+        let id: u64 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage().instance().set(
+            &key,
+            &id.checked_add(1).expect("Milestone escrow id exhausted"),
+        );
+
+        let mut released = Vec::new(&env);
+        for _ in milestone_amounts.iter() {
+            released.push_back(false);
+        }
+        let escrow = MilestoneEscrow {
+            id,
+            employer: employer.clone(),
+            contractor: contractor.clone(),
+            arbiter: arbiter.clone(),
+            token: token.clone(),
+            total_amount,
+            milestone_amounts,
+            released,
+            released_amount: 0,
+            status: MilestoneEscrowStatus::Pending,
+        };
+        token::Client::new(&env, &token).transfer(
+            &employer,
+            env.current_contract_address(),
+            &total_amount,
+        );
+        save_milestone_escrow(&env, &escrow);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_escrow_created"), id),
+            (employer, contractor, arbiter, total_amount),
+        );
+        id
+    }
+
+    /// Release one approved milestone's payout to the contractor.
+    pub fn approve_milestone(env: Env, employer: Address, escrow_id: u64, milestone_index: u32) {
+        employer.require_auth();
+        let mut escrow = load_milestone_escrow(&env, escrow_id);
+        if escrow.employer != employer {
+            panic_with_error!(&env, OrbitContractError::InvalidMilestoneEscrow);
+        }
+        assert!(
+            milestone_index < escrow.milestone_amounts.len(),
+            "milestone_index out of bounds"
+        );
+        if escrow.status == MilestoneEscrowStatus::Disputed
+            || escrow.status == MilestoneEscrowStatus::Refunded
+            || escrow.released.get(milestone_index) == Some(true)
+        {
+            panic_with_error!(&env, OrbitContractError::MilestoneAlreadyReleased);
+        }
+        let amount = escrow
+            .milestone_amounts
+            .get(milestone_index)
+            .expect("Milestone amount missing");
+        token::Client::new(&env, &escrow.token).transfer(
+            &env.current_contract_address(),
+            &escrow.contractor,
+            &amount,
+        );
+        escrow.released.set(milestone_index, true);
+        escrow.released_amount = escrow
+            .released_amount
+            .checked_add(amount)
+            .expect("Released total overflow");
+        escrow.status = MilestoneEscrowStatus::Approved;
+        save_milestone_escrow(&env, &escrow);
+        env.events().publish(
+            (
+                Symbol::new(&env, "milestone_approved"),
+                escrow_id,
+                milestone_index,
+            ),
+            (escrow.contractor.clone(), amount),
+        );
+    }
+
+    /// Either escrow party may escalate to the designated arbiter.
+    pub fn dispute_milestone_escrow(env: Env, caller: Address, escrow_id: u64) {
+        caller.require_auth();
+        let mut escrow = load_milestone_escrow(&env, escrow_id);
+        assert!(
+            caller == escrow.employer || caller == escrow.contractor,
+            "Only escrow parties may raise a dispute"
+        );
+        assert!(
+            escrow.status != MilestoneEscrowStatus::Refunded,
+            "Escrow already finalized"
+        );
+        escrow.status = MilestoneEscrowStatus::Disputed;
+        save_milestone_escrow(&env, &escrow);
+        env.events()
+            .publish((Symbol::new(&env, "milestone_disputed"), escrow_id), caller);
+    }
+
+    /// Arbiter-only resolution. The two splits must equal the still-escrowed
+    /// balance, so no tokens can be created or silently stranded.
+    pub fn resolve_dispute(
+        env: Env,
+        arbiter: Address,
+        escrow_id: u64,
+        employer_split: i128,
+        contractor_split: i128,
+    ) {
+        arbiter.require_auth();
+        let mut escrow = load_milestone_escrow(&env, escrow_id);
+        if escrow.arbiter != arbiter {
+            panic_with_error!(&env, OrbitContractError::InvalidMilestoneEscrow);
+        }
+        if escrow.status != MilestoneEscrowStatus::Disputed {
+            panic_with_error!(&env, OrbitContractError::MilestoneNotDisputed);
+        }
+        assert!(
+            employer_split >= 0 && contractor_split >= 0,
+            "Dispute splits must be non-negative"
+        );
+        let remaining = escrow
+            .total_amount
+            .checked_sub(escrow.released_amount)
+            .expect("Released exceeds deposited amount");
+        let split_total = employer_split
+            .checked_add(contractor_split)
+            .expect("Dispute split overflow");
+        if split_total != remaining {
+            panic_with_error!(&env, OrbitContractError::InvalidDisputeSplit);
+        }
+        let contract = env.current_contract_address();
+        if employer_split > 0 {
+            token::Client::new(&env, &escrow.token).transfer(
+                &contract,
+                &escrow.employer,
+                &employer_split,
+            );
+        }
+        if contractor_split > 0 {
+            token::Client::new(&env, &escrow.token).transfer(
+                &contract,
+                &escrow.contractor,
+                &contractor_split,
+            );
+        }
+        escrow.released_amount = escrow.total_amount;
+        escrow.status = MilestoneEscrowStatus::Refunded;
+        save_milestone_escrow(&env, &escrow);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_dispute_resolved"), escrow_id),
+            (employer_split, contractor_split),
+        );
+    }
+
+    pub fn get_milestone_escrow(env: Env, escrow_id: u64) -> Option<MilestoneEscrow> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MilestoneEscrow(escrow_id))
+    }
+
+    // ------------------------------------------------------------------------
+    // #226: SLIDING-WINDOW RATE LIMITS
+    // ------------------------------------------------------------------------
+
+    /// Configure a per-vault rolling window. Reconfiguring starts a fresh
+    /// window, so no new vault transaction is needed after a window expires.
+    pub fn configure_vault_rate_limit(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        window_duration_ledgers: u32,
+        max_cumulative_amount: i128,
+    ) {
+        user.require_auth();
+        assert!(
+            window_duration_ledgers > 0,
+            "window_duration_ledgers must be positive"
+        );
+        assert!(
+            max_cumulative_amount > 0,
+            "max_cumulative_amount must be positive"
+        );
+        let key = rate_limit_key(&user, &merchant);
+        let mut limit = env
+            .storage()
+            .persistent()
+            .get::<_, VaultRateLimit>(&key)
+            .unwrap_or(VaultRateLimit {
+                window_duration_ledgers,
+                max_cumulative_amount,
+                window_start_ledger: 0,
+                window_spent: 0,
+            });
+        limit.window_duration_ledgers = window_duration_ledgers;
+        limit.max_cumulative_amount = max_cumulative_amount;
+        limit.window_start_ledger = env.ledger().sequence();
+        limit.window_spent = 0;
+        env.storage().persistent().set(&key, &limit);
+        extend_feature_key(
+            &env,
+            &key,
+            u64::from(window_duration_ledgers) * SECONDS_PER_LEDGER,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "vault_rate_limit_configured"),
+                user,
+                merchant,
+            ),
+            (window_duration_ledgers, max_cumulative_amount),
+        );
+    }
+
+    pub fn get_vault_rate_limit(
+        env: Env,
+        user: Address,
+        merchant: Address,
+    ) -> Option<VaultRateLimit> {
+        env.storage()
+            .persistent()
+            .get(&rate_limit_key(&user, &merchant))
     }
 }
 
@@ -4609,19 +5954,47 @@ pub fn cancel_vault_meta_digest(
     meta_digest(env, "cancel_vault", &params, nonce, deadline)
 }
 
-/// Extracts the Ed25519 master key from an account (`G...`) user address.
-fn account_ed25519_key(env: &Env, user: &Address) -> BytesN<32> {
+/// Message a subscriber signs for `create_vault_delegated` (#296):
+/// `SHA256(contract_address || network_id || "create_vault_delegated" || XDR(authorization))`.
+///
+/// The contract address and network id bind the signature to this deployment
+/// and network; the function symbol keeps it from verifying as any other
+/// signed message. Public so relayers and tests build the exact same bytes.
+pub fn delegated_vault_digest(
+    env: &Env,
+    authorization: &DelegatedVaultAuthorization,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = env.current_contract_address().to_xdr(env);
+    data.append(&Bytes::from_array(
+        env,
+        &env.ledger().network_id().to_array(),
+    ));
+    data.append(&Symbol::new(env, "create_vault_delegated").to_xdr(env));
+    data.append(&authorization.clone().to_xdr(env));
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// The Ed25519 key behind an account (`G...`) address, or `None` for any
+/// other address kind (e.g. a contract), which cannot sign with Ed25519.
+fn ed25519_account_key(env: &Env, user: &Address) -> Option<BytesN<32>> {
     use soroban_sdk::xdr::ToXdr;
     // ScVal::Address XDR: 4-byte discriminant, 4-byte address type, 4-byte
     // key type, then the 32-byte Ed25519 public key for account addresses.
     let xdr = user.clone().to_xdr(env);
-    let addr_type: BytesN<4> = xdr.slice(4..8).try_into().expect("Address payload");
-    assert_eq!(
-        addr_type.to_array(),
-        [0, 0, 0, 0],
-        "User must be an account address"
-    );
-    xdr.slice(12..44).try_into().expect("account ed25519 key")
+    if xdr.len() < 44 {
+        return None;
+    }
+    let addr_type: BytesN<4> = xdr.slice(4..8).try_into().ok()?;
+    if addr_type.to_array() != [0, 0, 0, 0] {
+        return None;
+    }
+    xdr.slice(12..44).try_into().ok()
+}
+
+/// Extracts the Ed25519 master key from an account (`G...`) user address.
+fn account_ed25519_key(env: &Env, user: &Address) -> BytesN<32> {
+    ed25519_account_key(env, user).expect("User must be an account address")
 }
 
 fn verify_meta_signature(env: &Env, user: &Address, digest: &BytesN<32>, signature: &BytesN<64>) {
@@ -4647,14 +6020,59 @@ fn validate_splits(splits: &Vec<PaymentSplit>) -> i128 {
     total_amount
 }
 
-/// Transfers each split from the sender's allowance to its recipient.
-fn disburse(env: &Env, sender: &Address, token: &Address, splits: Vec<PaymentSplit>) {
-    let token_client = token::Client::new(env, token);
+/// Aggregates required amounts per unique token contract, in first-appearance
+/// order so the summary event is deterministic.
+fn payroll_totals(env: &Env, splits: &Vec<PaymentSplit>) -> Vec<(Address, i128)> {
+    let mut totals: Vec<(Address, i128)> = Vec::new(env);
+    for split in splits.iter() {
+        let mut index = None;
+        for (position, entry) in totals.iter().enumerate() {
+            if entry.0 == split.token {
+                index = Some(position);
+                break;
+            }
+        }
+        match index {
+            Some(position) => {
+                let entry = totals.get(position as u32).expect("Token total missing");
+                let total = entry
+                    .1
+                    .checked_add(split.amount)
+                    .expect("Payroll token total overflow");
+                let mut rebuilt = Vec::new(env);
+                for (current, item) in totals.iter().enumerate() {
+                    if current == position {
+                        rebuilt.push_back((item.0, total));
+                    } else {
+                        rebuilt.push_back(item);
+                    }
+                }
+                totals = rebuilt;
+            }
+            None => totals.push_back((split.token.clone(), split.amount)),
+        }
+    }
+    totals
+}
 
-    // Loop through the array of contractors and amounts
+/// Verifies that the sender has approved enough of every distinct token used by
+/// the batch before any transfer is executed (#301).
+fn verify_payroll_allowances(env: &Env, sender: &Address, splits: &Vec<PaymentSplit>) {
+    let contract = env.current_contract_address();
+    for (token, required) in payroll_totals(env, splits).iter() {
+        let allowance = token::Client::new(env, &token).allowance(sender, &contract);
+        assert!(
+            allowance >= required,
+            "Insufficient allowance for payroll token"
+        );
+    }
+}
+
+/// Transfers each split in its own token contract. Atomicity is provided by
+/// Soroban: a failed transfer reverts every earlier transfer in the batch.
+fn disburse(env: &Env, sender: &Address, splits: Vec<PaymentSplit>) {
     for split in splits.into_iter() {
-        // Transfer the exact cut directly from the sender's wallet to the contractor
-        token_client.transfer_from(
+        token::Client::new(env, &split.token).transfer_from(
             &env.current_contract_address(),
             sender,
             &split.recipient,
@@ -4769,6 +6187,19 @@ fn save_merkle_payroll(env: &Env, claim_id: u64, payroll: &MerklePayrollData) {
         .extend_ttl(&key, threshold, extend_to);
 }
 
+/// Canonical reward leaf preimage: domain tag, then the length-prefixed
+/// Address XDR, then the amount as 16 big-endian bytes. Length-prefixing makes
+/// the encoding unambiguous and keeps leaves distinct from 64-byte inner nodes.
+pub fn reward_leaf(env: &Env, claimant: &Address, amount: i128) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = Bytes::from_slice(env, REWARD_LEAF_DOMAIN);
+    let address = claimant.clone().to_xdr(env);
+    data.extend_from_array(&address.len().to_be_bytes());
+    data.append(&address);
+    data.extend_from_array(&amount.to_be_bytes());
+    env.crypto().sha256(&data).to_bytes()
+}
+
 /// Merkle payroll leaf: `SHA256(recipient_xdr || amount as 16 big-endian bytes)`.
 /// The XDR address encoding is never 64 bytes long, so a leaf preimage can't be
 /// mistaken for an inner node (`left || right`).
@@ -4825,4 +6256,3 @@ mod test_fuzz;
 
 #[cfg(test)]
 mod test_storage;
->>>>>>> upstream/main

@@ -41,7 +41,7 @@ describe('Federated merchant analytics API', () => {
   it('rejects excessive GraphQL depth and complexity before execution', () => {
     expect(() => validateGraphqlQuery('{ merchant(id: "7f8b9a10-b2c3-4d5e-a6f7-112233445566") { plans { merchant { plans { merchant { plans { merchant { plans { name } } } } } } } } }'))
       .toThrow(/depth exceeds maximum|depth/);
-    expect(() => validateGraphqlQuery('{ subscribers { nodes { plan { merchant { subscriptions { nodes { payments(pagination: { limit: 100 }) { id } } } } } } } } }'))
+    expect(() => validateGraphqlQuery('{ subscribers { nodes { plan { merchant { subscriptions { nodes { payments(pagination: { limit: 100 }) { id } } } } } } } }'))
       .toThrow(/complexity.*exceeds maximum/);
   });
   it('allows a higher GraphQL budget for an internal service token', () => {

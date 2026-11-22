@@ -25,6 +25,7 @@ import { signMessage } from "@stellar/freighter-api";
 import { AnalyticsRange, MerchantAnalytics, getAnalyticsChallenge, verifyAnalyticsSignature,
   fetchMerchantAnalytics, formatRawUsdc, plotVerifiedRevenue } from "@/lib/merchant-analytics";
 import { DashboardTab, NetworkId, NETWORKS } from "../dashboard-types";
+import { TreasuryBalances } from "../treasury-balances";
 
 interface OverviewViewProps {
   user: MerchantUser;
@@ -184,6 +185,7 @@ const session = await verifyAnalyticsSignature(
 
   return (
     <div className="space-y-8">
+      <TreasuryBalances address={settlementAddress} network={activeNetwork} />
       {/* 1. Treasury Settlement Vault Card */}
       <div className="rounded-xl border border-black/10 bg-white p-6 shadow-xs">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-black/5">
