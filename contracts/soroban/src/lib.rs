@@ -2,17 +2,13 @@
 #![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
-<<<<<<< HEAD
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec, Bytes};
-
-/// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
-pub const SECONDS_PER_LEDGER: u64 = 5;
-=======
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     String, Symbol, Vec,
 };
->>>>>>> upstream/main
+
+/// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
+pub const SECONDS_PER_LEDGER: u64 = 5;>>> upstream/main
 
 // ----------------------------------------------------------------------------
 // CONSTANTS: STATE ARCHIVAL & TTL MANAGEMENT
@@ -4822,9 +4818,6 @@ fn save_proposal(env: &Env, proposal: &PayrollProposal) {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
-mod test;
-=======
 mod test;
 
 #[cfg(test)]

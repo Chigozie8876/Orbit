@@ -2043,7 +2043,9 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
-<<<<<<< HEAD
+res.json({ webhook: data, signing_secret: secret });
+})
+
 /// @route GET /api/verify/invoice/:invoiceId
 /// @desc Verify invoice cryptographic signature and return settlement details
 /// @access Merchant authenticated
@@ -2090,7 +2092,9 @@ app.get('/api/verify/invoice/:invoiceId', authenticateMerchant, async (req, res)
         });
     } catch (err) {
         console.error('Error verifying invoice:', err);
-=======
+    }
+});
+
 app.post('/webhooks/:id/backfill', async (req, res) => {
     const parseResult = backfillWebhookSchema.safeParse(req.body || {});
     if (!parseResult.success) {
@@ -2122,8 +2126,6 @@ app.post('/webhooks/:id/backfill', async (req, res) => {
             return res.status(404).json({ error: "Webhook not found" });
         }
         console.error("Error executing webhook backfill:", err);
->>>>>>> upstream/main
-        res.status(500).json({ error: err.message });
     }
 });
 
