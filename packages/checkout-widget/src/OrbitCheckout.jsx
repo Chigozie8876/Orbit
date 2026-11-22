@@ -127,7 +127,7 @@ export default function OrbitCheckout({
   accentColor = "#6366f1",
   borderRadius = "md",
   fontFamily = "inherit",
-  customClasses = {},
+customClasses = {},
   allowedOrigins = DEFAULT_ALLOWED_ORIGINS,
   customFields = [],
   captureEmail = false,
@@ -215,6 +215,7 @@ export default function OrbitCheckout({
   const [pending, setPending] = useState(null);
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
+  const [agreedToTerms, setAgreedToTerms] = useState(false);
 
   // Connection monitoring & offline detection (#310)
   const [isOnline, setIsOnline] = useState(() => {
@@ -1268,7 +1269,7 @@ export default function OrbitCheckout({
       setConfirming(true);
       setConfirmingSeconds(60);
 
-      let hashes;
+let hashes;
       if (isSwap) {
         hashes = {
           approvalHash: null,
@@ -2149,6 +2150,29 @@ export default function OrbitCheckout({
               </strong>{" "}
               {address.slice(0, 8)}...{address.slice(-5)}
             </p>
+            {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
+            {termsUrl || privacyUrl && (
+              <div style={{ marginTop: 12, padding: 12, background: 'var(--orbit-surface)', border: '1px solid var(--orbit-border)', borderRadius: 'var(--orbit-radius)', fontSize: 12 }}>
+                <p style={{ marginBottom: 8, color: 'var(--orbit-text)' }}>
+                  {termsUrl ? <span style={{ color: 'var(--orbit-link)' }} onClick={() => window.open(termsUrl, '_blank') }>Terms of Service</span> : ''}
+                  {privacyUrl ? <span style={{ marginLeft: 12, color: 'var(--orbit-link)' }} onClick={() => window.open(privacyUrl, '_blank') }>Privacy Policy</span> : ''}
+                </p>
+                <label style={{ display: 'block', marginTop: 8, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={agreedToTerms}
+                    onChange={(e) => setAgreedToTerms(e.target.checked)}
+                    style={{ transform: 'scale(1.2)', marginRight: 4 }}
+                  />
+                  I agree to the {"terms and conditions"} required to complete the subscription.
+                </label>
+              </div>
+            )}
+            <button
+              className={customClasses.button}
+              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1, display: agreedToTerms || !termsUrl && !privacyUrl ? 1 : agreedToTerms ? 1 : 0.5 }}
+              disabled={processing || isWrongNetwork || (!agreedToTerms && (termsUrl || privacyUrl))}
+=======
             {isSessionKey && (
               <div
                 style={{
@@ -2171,10 +2195,23 @@ export default function OrbitCheckout({
                 </span>
               </div>
             )}
-            {isDemo && (
-              <p role="note">
-                Demo mode never signs transactions or creates a subscription.
-              </p>
+            {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
+            {termsUrl || privacyUrl && (
+              <div style={{ marginTop: 12, padding: 12, background: 'var(--orbit-surface)', border: '1px solid var(--orbit-border)', borderRadius: 'var(--orbit-radius)', fontSize: 12 }}>
+                <p style={{ marginBottom: 8, color: 'var(--orbit-text)' }}>
+                  {termsUrl ? <span style={{ color: 'var(--orbit-link)' }} onClick={() => window.open(termsUrl, '_blank') }>Terms of Service</span> : ''}
+                  {privacyUrl ? <span style={{ marginLeft: 12, color: 'var(--orbit-link)' }} onClick={() => window.open(privacyUrl, '_blank') }>Privacy Policy</span> : ''}
+                </p>
+                <label style={{ display: 'block', marginTop: 8, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={agreedToTerms}
+                    onChange={(e) => setAgreedToTerms(e.target.checked)}
+                    style={{ transform: 'scale(1.2)', marginRight: 4 }}
+                  />
+                  I agree to the {"terms and conditions"} required to complete the subscription.
+                </label>
+              </div>
             )}
 
             {/* Network Status & Dynamic Fee Breakdown (#Task 1) */}
@@ -2312,8 +2349,6 @@ export default function OrbitCheckout({
 
             <button
               className={customClasses.button}
-              style={{ ...styles.button, opacity: (isWrongNetwork || !isOnline) ? 0.6 : 1 }}
-              disabled={processing || isWrongNetwork || !isOnline}
               style={{
                 ...styles.button,
                 opacity: isWrongNetwork || !consentSatisfied ? 0.6 : 1,
@@ -2325,6 +2360,7 @@ export default function OrbitCheckout({
                 (!isSwap && !isDemo && (usdcCheckPending || !!usdcCheckError || usdcReadiness?.status !== "ready")) ||
                 (isSwap && (!swapQuote || swapQuoteLoading))
               }
+>>>>>>> upstream/main
               onClick={subscribe}
               title={!isSwap && !isDemo ? (usdcCheckError || usdcReadinessMessage(usdcReadiness) || undefined) : undefined}
             >

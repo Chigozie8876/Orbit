@@ -2170,6 +2170,57 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
+<<<<<<< HEAD
+res.json({ webhook: data, signing_secret: secret });
+})
+
+/// @route GET /api/verify/invoice/:invoiceId
+/// @desc Verify invoice cryptographic signature and return settlement details
+/// @access Merchant authenticated
+app.get('/api/verify/invoice/:invoiceId', authenticateMerchant, async (req, res) => {
+    const { invoiceId } = req.params;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: 'Supabase client not initialized' });
+
+    try {
+        // Query the invoice from the database
+        const { data, error } = await supabase
+            .from('invoices')
+            .select('*')
+            .eq('id', invoiceId)
+            .single();
+
+        if (error || !data) return res.status(404).json({ error: 'Invoice not found' });
+
+        // Compute SHA-256 hash of invoice parameters for verification
+        const verificationInput = {
+            merchant_address: data.merchant_address,
+            invoice_id: data.invoice_id,
+            amount: data.amount,
+            timestamp: data.timestamp,
+        };
+        const verificationHash = crypto.createHash('sha256')
+            .update(JSON.stringify(verificationInput))
+            .digest('hex');
+
+        // Check if the invoice has been tampered with by comparing stored vs current data
+        const isValid = data.verification_status !== 'tampered';
+
+        // Return verification status and settlement details
+        res.json({
+            invoice_id: data.invoice_id,
+            merchant_address: data.merchant_address,
+            amount: data.amount,
+            verification_status: data.verification_status,
+            verification_hash,
+            is_valid: isValid,
+            settled_at: data.settled_at,
+            settlement_transaction: data.settlement_transaction,
+            verified_at: data.verified_at,
+        });
+    } catch (err) {
+        console.error('Error verifying invoice:', err);
+=======
 app.post('/webhooks/:id/verify', async (req, res) => {
     try {
         const supabase = getSupabase();
@@ -2182,6 +2233,7 @@ app.post('/webhooks/:id/verify', async (req, res) => {
         res.status(result.ok ? 200 : 502).json(result);
     } catch (err) {
         res.status(err.status || 500).json({ error: err.message });
+>>>>>>> upstream/main
     }
 });
 
@@ -2216,7 +2268,6 @@ app.post('/webhooks/:id/backfill', async (req, res) => {
             return res.status(404).json({ error: "Webhook not found" });
         }
         console.error("Error executing webhook backfill:", err);
-        res.status(500).json({ error: err.message });
     }
 });
 
